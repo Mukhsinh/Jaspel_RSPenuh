@@ -1,0 +1,164 @@
+import { Suspense } from 'react'
+import { createClient, createAdminClient } from '@/lib/supabase/server'
+import { redirect } from 'next/navigation'
+import { isRedirectError } from 'next/dist/client/components/redirect-error'
+import AssessmentPageContent from '@/components/assessment/AssessmentPageContent'
+import { getAuthenticatedUser } from '@/lib/supabase/auth-helper'
+
+export const dynamic = 'force-dynamic'
+export const revalidate = 0
+
+async function getAvailablePeriods(supabase: any): Promise<string[]> {
+  try {
+    // Query periods from t_employee_periods first to prioritize locked and active employee periods matching /pegawai
+    const { data: empPeriods } = await supabase
+      .from('t_employee_periods')
+      .select('period')
+      .order('period', { ascending: false })
+
+    const { data: poolData } = await supabase
+      .from('t_pool')
+      .select('period')
+      .order('period', { ascending: false })
+
+    const periodsSet = new Set<string>()
+    empPeriods?.forEach((item: any) => {
+      if (item.period) periodsSet.add(item.period)
+    })
+    poolData?.forEach((item: any) => {
+      if (item.period) periodsSet.add(item.period)
+    })
+
+    return Array.from(periodsSet).sort((a, b) => b.localeCompare(a))
+  } catch (error) {
+    console.error('Exception in getAvailablePeriods:', error)
+    return []
+  }
+}
+
+export default async function AssessmentPage() {
+  try {
+    const supabase = await createClient()
+
+    // Get user safely using rate-limit-resistant auth-helper
+    const user = await getAuthenticatedUser(supabase)
+    if (!user) {
+      redirect('/login')
+    }
+
+    const availablePeriods = await getAvailablePeriods(supabase)
+
+    const authRole = user.app_metadata?.role || user.user_metadata?.role || (user as any).role
+    let isSuperAdmin = authRole === 'superadmin' || authRole === 'admin' || user.email === 'admin@sungaipenuh.com'
+
+    const fetchClient = isSuperAdmin ? await createAdminClient() : supabase
+
+    // Get current user's employee record with error handling
+    let currentEmployee: any = null
+    try {
+      const { data: byUserId } = await fetchClient
+        .from('m_employees')
+        .select('id, role, unit_id, full_name')
+        .eq('user_id', user.id)
+        .maybeSingle()
+
+      if (byUserId) {
+        currentEmployee = byUserId
+      } else if (user.email) {
+        const { data: empByEmail } = await fetchClient
+          .from('m_employees')
+          .select('id, role, unit_id, full_name, user_id')
+          .eq('email', user.email)
+          .maybeSingle()
+
+        if (empByEmail) {
+          currentEmployee = empByEmail
+          if (!empByEmail.user_id) {
+            const adminClient = await createAdminClient()
+            await adminClient.from('m_employees').update({ user_id: user.id }).eq('id', empByEmail.id)
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Error fetching employee record for assessment page:', err)
+    }
+
+    if (!currentEmployee) {
+      if (isSuperAdmin || authRole === 'admin') {
+        currentEmployee = {
+          id: user.id,
+          full_name: user.user_metadata?.full_name || 'Super Administrator',
+          role: 'superadmin',
+          unit_id: '0'
+        }
+      } else {
+        currentEmployee = {
+          id: user.id,
+          full_name: user.email || 'Pengguna',
+          role: 'unit_manager',
+          unit_id: 'all'
+        }
+      }
+    }
+
+    // Use database role if defined, otherwise fallback to Auth metadata for superadmin detection
+    if (currentEmployee.role === 'superadmin' || currentEmployee.role === 'admin') {
+      isSuperAdmin = true
+    }
+    if (isSuperAdmin) {
+      currentEmployee.role = 'superadmin'
+    }
+
+    // Fetch units on the server based on role (superadmin sees all, unit manager sees only their unit)
+    let initialAvailableUnits: { id: string; name: string }[] = []
+    try {
+      const unitsClient = await createAdminClient()
+      let unitsQuery = unitsClient
+        .from('m_units')
+        .select('id, name, code')
+        .eq('is_active', true)
+        .order('name')
+
+      if (currentEmployee.role === 'unit_manager' && currentEmployee.unit_id && currentEmployee.unit_id !== 'all') {
+        unitsQuery = unitsQuery.eq('id', currentEmployee.unit_id)
+      }
+
+      const { data: unitsData } = await unitsQuery
+
+      initialAvailableUnits = (unitsData || [])
+        .filter((u: any) => u.code?.toUpperCase() !== 'ADMIN' && u.name?.toUpperCase() !== 'SUPERADMIN')
+        .map(({ id, name }: any) => ({ id, name }))
+    } catch (e) {
+      console.error('Error fetching initial units on server:', e)
+    }
+
+    return (
+      <div className="container mx-auto px-4 py-8">
+        <div className="mb-8">
+          <h1 className="text-3xl font-bold text-gray-900 mb-2">Penilaian KPI</h1>
+          <p className="text-gray-600">
+            Kelola penilaian kinerja pegawai berdasarkan indikator KPI yang telah dikonfigurasi
+          </p>
+        </div>
+
+        <Suspense fallback={
+          <div className="flex items-center justify-center py-12">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+          </div>
+        }>
+          <AssessmentPageContent
+            currentEmployee={currentEmployee}
+            availablePeriods={availablePeriods}
+            initialAvailableUnits={initialAvailableUnits}
+          />
+        </Suspense>
+      </div>
+    )
+  } catch (error: any) {
+    if (isRedirectError(error)) {
+      throw error
+    }
+    console.error('Assessment page error:', error)
+    redirect('/dashboard')
+  }
+}

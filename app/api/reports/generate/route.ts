@@ -1,0 +1,2327 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { createAdminClient, createClient } from '@/lib/supabase/server'
+import { getAuthenticatedUser } from '@/lib/supabase/auth-helper'
+import { isMedicalUnit, isPartialEligibleUnit } from '@/lib/utils/medical-unit'
+import { getTERCategory, getTERRate } from '@/lib/formulas/ter-lookup'
+import { getCachedKpiMetadata, getOrSetCache } from '@/lib/utils/server-cache'
+
+export const maxDuration = 60
+export const dynamic = 'force-dynamic'
+
+const OMIT_KEYS = ['created_at', 'updated_at', 'created_by', 'updated_by']
+
+/**
+ * Batched .in() helper to avoid Supabase PostgREST URL length overflow.
+ * Splits large arrays into chunks, queries batches in parallel, and merges results.
+ */
+async function batchedIn(
+  supabase: any,
+  table: string,
+  selectFields: string,
+  filterColumn: string,
+  filterValues: string[],
+  additionalFilters?: (q: any) => any,
+  batchSize: number = 400
+): Promise<any[]> {
+  if (filterValues.length === 0) return []
+
+  const batches: string[][] = []
+  for (let i = 0; i < filterValues.length; i += batchSize) {
+    batches.push(filterValues.slice(i, i + batchSize))
+  }
+
+  const concurrency = 2
+  const results: any[] = []
+
+  for (let i = 0; i < batches.length; i += concurrency) {
+    const chunk = batches.slice(i, i + concurrency)
+    const chunkPromises = chunk.map(async (batch) => {
+      const batchRows: any[] = []
+      let page = 0
+      let hasMore = true
+      const pageSize = 1000
+
+      while (hasMore) {
+        const from = page * pageSize
+        const to = from + pageSize - 1
+
+        let query = supabase.from(table).select(selectFields).in(filterColumn, batch).range(from, to)
+        if (additionalFilters) query = additionalFilters(query)
+
+        const { data, error } = await query
+        if (error) {
+          console.error(`[batchedIn] Error fetching batch from ${table}:`, error)
+          throw error
+        }
+
+        if (data && data.length > 0) {
+          batchRows.push(...data)
+          if (data.length < pageSize) {
+            hasMore = false
+          } else {
+            page++
+          }
+        } else {
+          hasMore = false
+        }
+      }
+      return batchRows
+    })
+
+    const chunkResults = await Promise.all(chunkPromises)
+    for (const r of chunkResults) {
+      results.push(...r)
+    }
+  }
+
+  console.log(`[batchedIn] ${table}.${filterColumn}: ${filterValues.length} IDs -> ${results.length} total rows fetched`)
+  return results
+}
+
+/**
+ * Fast period assessment fetcher that uses parallel pagination instead of sequential N+1 queries.
+ */
+async function fetchPeriodAssessmentsFast(
+  supabase: any,
+  selectFields: string,
+  period: string,
+  revenueType: string | null,
+  isSub: boolean,
+  targetEmpIds?: string[]
+): Promise<any[]> {
+  // If specific small set of employees (<= 80), use batchedIn directly
+  if (targetEmpIds && targetEmpIds.length > 0 && targetEmpIds.length <= 80) {
+    return batchedIn(
+      supabase,
+      't_kpi_assessments',
+      selectFields,
+      'employee_id',
+      targetEmpIds,
+      q => {
+        let qry = q.eq('period', period)
+        if (isSub) {
+          qry = qry.not('sub_indicator_id', 'is', null)
+        } else {
+          qry = qry.is('sub_indicator_id', null)
+        }
+        if (revenueType && revenueType !== 'all') {
+          qry = qry.eq('revenue_type', revenueType)
+        }
+        return qry
+      },
+      80
+    )
+  }
+
+  // When querying all units or large set: query by period in parallel pages
+  let countQry = supabase.from('t_kpi_assessments').select('id', { count: 'exact', head: true }).eq('period', period)
+  if (isSub) {
+    countQry = countQry.not('sub_indicator_id', 'is', null)
+  } else {
+    countQry = countQry.is('sub_indicator_id', null)
+  }
+  if (revenueType && revenueType !== 'all') {
+    countQry = countQry.eq('revenue_type', revenueType)
+  }
+
+  const { count, error: countErr } = await countQry
+  if (countErr) {
+    console.error('[fetchPeriodAssessmentsFast] Count error:', countErr)
+    throw countErr
+  }
+  if (!count || count === 0) return []
+
+  const pageSize = 1000
+  const numPages = Math.ceil(count / pageSize)
+  const pagePromises = []
+
+  for (let p = 0; p < numPages; p++) {
+    const from = p * pageSize
+    const to = from + pageSize - 1
+    let qry = supabase.from('t_kpi_assessments').select(selectFields).eq('period', period).order('id', { ascending: true }).range(from, to)
+    if (isSub) {
+      qry = qry.not('sub_indicator_id', 'is', null)
+    } else {
+      qry = qry.is('sub_indicator_id', null)
+    }
+    if (revenueType && revenueType !== 'all') {
+      qry = qry.eq('revenue_type', revenueType)
+    }
+    pagePromises.push(qry)
+  }
+
+  const pageResults = await Promise.all(pagePromises)
+  let allRows: any[] = []
+  for (const res of pageResults) {
+    if (res.error) throw res.error
+    if (res.data) allRows.push(...res.data)
+  }
+
+  // If targetEmpIds provided, filter in memory
+  if (targetEmpIds && targetEmpIds.length > 0) {
+    const empSet = new Set(targetEmpIds)
+    allRows = allRows.filter((r: any) => empSet.has(r.employee_id))
+  }
+
+  console.log(`[fetchPeriodAssessmentsFast] Fetched ${allRows.length} rows (period=${period}, rev=${revenueType}, sub=${isSub})`)
+  return allRows
+}
+
+function calculatePPh21(
+  monthlyGross: number,
+  employeeStatus?: string,
+  taxType?: string,
+  taxStatus: string = 'TK/0',
+  pnsGrade?: string | number,
+  mechanism: 'none' | 'ter' | 'final_pp80' = 'ter'
+): { amount: number, text: string } {
+  if (monthlyGross <= 0) return { amount: 0, text: 'Rp 0' }
+
+  // 1. Tanpa Potongan Pajak
+  if (mechanism === 'none') return { amount: 0, text: 'Tanpa Potongan (0%)' }
+
+  // 2. Mekanisme Final (PP 80/2010)
+  if (mechanism === 'final_pp80') {
+    // Only applies to ASN (PNS) or if a grade is explicitly provided
+    // status can be in employeeStatus (legacy) or potentially passed via employmentStatus
+    const stat = (employeeStatus || '').toUpperCase()
+    const gradeStr = String(pnsGrade || '').trim().toUpperCase()
+    const hasGrade = gradeStr !== '' && gradeStr !== '-' && gradeStr !== 'NULL'
+
+    // PPPK and BLUD are treated as Grade II or below (0% tax under PP 80/2010)
+    if (stat === 'PPPK' || stat === 'BLUD') {
+      return { amount: 0, text: `${stat} (Bukan PNS/ASN - 0%)` }
+    }
+
+    // Robust check: If status is 'ASN'/'PNS' OR it's 'ACTIVE' with a valid grade, treat as PNS
+    if (stat !== 'ASN' && stat !== 'PNS' && stat !== 'ACTIVE' && stat !== 'PNS' && !hasGrade) {
+      return { amount: 0, text: 'Bukan PNS/ASN (0%)' }
+    }
+
+    if (gradeStr.startsWith('IV') || gradeStr.startsWith('4')) {
+      return { amount: Math.round(monthlyGross * 0.15), text: `15% x Bruto (PNS Golongan IV)` }
+    }
+    if (gradeStr.startsWith('III') || gradeStr.startsWith('3')) {
+      return { amount: Math.round(monthlyGross * 0.05), text: `5% x Bruto (PNS Golongan III)` }
+    }
+    if (gradeStr.startsWith('II') || gradeStr.startsWith('2') || gradeStr.startsWith('I') || gradeStr.startsWith('1')) {
+      return { amount: 0, text: `Golongan II Kebawah (0%)` }
+    }
+
+    // Fallback detection ONLY if status is ASN/PNS and grade is not provided
+    if (!hasGrade && (stat === 'ASN' || stat === 'PNS' || stat === 'ACTIVE')) {
+      return { amount: Math.round(monthlyGross * 0.05), text: `5% x Bruto (PNS - Gradeless fallback)` }
+    }
+
+    return { amount: 0, text: `Golongan II Kebawah / Lainnya (0%)` }
+  }
+
+  // 3. Mekanisme TER (PP 58/2023) - Default
+  // Ensure that if 'ter' is globally chosen, it calculates TER for everyone based on PTKP
+  // We do NOT exempt ASN Final here because setting ter globally overrides legacy Final tax rules.
+
+  // Get TER Category based on PTKP status
+  const category = getTERCategory(taxStatus)
+
+  // Get TER Rate based on Category and monthly gross income
+  const ratePercentage = getTERRate(category, monthlyGross)
+
+  // Calculate Tax
+  const taxAmount = (monthlyGross * ratePercentage) / 100
+
+  return { amount: Math.round(taxAmount), text: `${ratePercentage}% x Bruto (TER Kategori ${category})` }
+}
+
+/**
+ * Save PIR history for audit trail.
+ * Upserts record per period+unit combination.
+ */
+async function savePIRHistory(
+  supabase: any,
+  period: string,
+  unitId: string,
+  unitName: string,
+  netPoolAmount: number,
+  proportionPercentage: number,
+  allocatedForUnit: number,
+  totalSkorKolektif: number,
+  pirValue: number,
+  employeeCount: number
+) {
+  try {
+    const { data: existing } = await supabase
+      .from('t_history_pir')
+      .select('id')
+      .eq('period', period)
+      .eq('unit_id', unitId)
+      .maybeSingle()
+
+    const pirData = {
+      period,
+      unit_id: unitId,
+      unit_name: unitName,
+      net_pool_amount: netPoolAmount,
+      proportion_percentage: proportionPercentage,
+      allocated_for_unit: allocatedForUnit,
+      total_skor_kolektif: totalSkorKolektif,
+      pir_value: pirValue,
+      employee_count: employeeCount,
+    }
+
+    if (existing?.id) {
+      const { error: upErr } = await supabase
+        .from('t_history_pir')
+        .update(pirData)
+        .eq('id', existing.id)
+      if (upErr) console.error('Failed to update PIR history:', upErr.message)
+    } else {
+      const { error: inErr } = await supabase
+        .from('t_history_pir')
+        .insert(pirData)
+      if (inErr) console.error('Failed to insert PIR history:', inErr.message)
+    }
+  } catch (err: any) {
+    console.error('PIR history save error:', err.message)
+  }
+}
+
+/**
+ * Generate reports based on type and period
+ * Requirements: 12.1, 12.2, 12.3, 12.4, 12.7, 12.8
+ */
+export async function POST(request: NextRequest) {
+  try {
+    const { reportType, period, unitId: reqUnitId, employeeId, detailLevel, revenueType = 'all' } = await request.json()
+
+    if (!reportType || !period) {
+      return NextResponse.json(
+        { error: 'Report type and period are required' },
+        { status: 400 }
+      )
+    }
+
+    const supabaseClient = await createClient()
+    const user = await getAuthenticatedUser(supabaseClient, request)
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const supabase = await createAdminClient()
+
+    // Get user employee info for RBAC
+    let { data: employee } = await supabase
+      .from('m_employees')
+      .select('role, unit_id')
+      .eq('user_id', user.id)
+      .maybeSingle()
+
+    if (!employee && user.email) {
+      const { data: empByEmail } = await supabase
+        .from('m_employees')
+        .select('role, unit_id')
+        .eq('email', user.email)
+        .maybeSingle()
+      if (empByEmail) {
+        employee = empByEmail
+      }
+    }
+
+    const authRole = user.app_metadata?.role || user.user_metadata?.role || (user as any).role
+    const isSuperAdmin = authRole === 'superadmin' || authRole === 'admin' || user.email === 'admin@sungaipenuh.com' || employee?.role === 'superadmin'
+
+    if (!employee) {
+      if (isSuperAdmin) {
+        employee = { role: 'superadmin', unit_id: '0' }
+      } else {
+        return NextResponse.json({ error: 'Employee not found' }, { status: 404 })
+      }
+    }
+
+    // Force role override if auth metadata says superadmin
+    if (isSuperAdmin && employee) {
+      employee.role = 'superadmin'
+    }
+
+    // Role-based restrictions
+    let unitId = reqUnitId
+    if (employee.role === 'unit_manager') {
+      // Force unit manager to their own unit
+      unitId = employee.unit_id
+      if (reportType === 'unit-comparison') {
+        return NextResponse.json({ error: 'Akses ditolak: Manajer unit tidak dapat mengakses laporan perbandingan unit.' }, { status: 403 })
+      }
+    }
+
+    // 1. Prerequisite Check: Data Pool
+    const { data: poolExists, error: poolCheckError } = await supabase
+      .from('t_pool')
+      .select('id')
+      .eq('period', period)
+      .maybeSingle()
+
+    if (!poolExists) {
+      return NextResponse.json({
+        success: false,
+        error: `Data Pool tidak ditemukan untuk periode ${period}. Laporan tidak dapat dibuat tanpa konfigurasi Pool.`
+      }, { status: 400 })
+    }
+
+    // 2. Prerequisite Check: Data Penilaian (KPI)
+    // We check if at least one assessment exists for this period
+    let assessmentQuery = supabase
+      .from('t_kpi_assessments')
+      .select('id')
+      .eq('period', period)
+      .limit(1)
+
+    if (revenueType && revenueType !== 'all') {
+      assessmentQuery = assessmentQuery.eq('revenue_type', revenueType)
+    }
+
+    if (unitId && unitId !== 'all') {
+      // If a unit is specified, we check if there are assessments for employees in that unit for this period
+      let unitEmps: any[] = []
+      const { data: snapEmps } = await supabase
+        .from('t_employee_period_snapshots')
+        .select('employee_id')
+        .eq('period', period)
+        .eq('unit_id', unitId)
+        .eq('is_active', true)
+        .neq('role', 'superadmin')
+        .range(0, 9999)
+
+      if (snapEmps && snapEmps.length > 0) {
+        unitEmps = snapEmps.map((e: any) => ({ id: e.employee_id }))
+      } else {
+        const { data: mEmps } = await supabase
+          .from('m_employees')
+          .select('id')
+          .eq('unit_id', unitId)
+          .eq('is_active', true)
+          .neq('role', 'superadmin')
+          .range(0, 9999)
+        unitEmps = mEmps || []
+      }
+
+      const empIds = unitEmps?.map(e => e.id) || []
+      if (empIds.length > 0) {
+        // Use all employee IDs for prerequisite check to avoid missing data if the sample doesn't have assessments
+        assessmentQuery = assessmentQuery.in('employee_id', empIds)
+      } else {
+        return NextResponse.json({
+          success: false,
+          error: `Tidak ada data karyawan di unit yang dipilih untuk periode ${period}.`
+        }, { status: 400 })
+      }
+    }
+
+    const { data: assessmentExists, error: assCheckError } = await assessmentQuery.maybeSingle()
+
+    if (!assessmentExists) {
+      return NextResponse.json({
+        success: false,
+        error: `Data Penilaian belum diisi untuk periode ${period}. Laporan tidak dapat digenerate jika data penilaian kosong.`
+      }, { status: 400 })
+    }
+
+    let data: any[] = []
+
+    const _mergeIncentives = (list1: any[], list2: any[]) => {
+      const mergedMap = new Map<string, any>();
+      for (const row of list1) mergedMap.set(row.employee_id || row.nik + row.employee_name, { ...row });
+      for (const row of list2) {
+        const id = row.employee_id || row.nik + row.employee_name;
+        const existing = mergedMap.get(id);
+        if (existing) {
+          const mergeIndexScore = (s1: any, s2: any) => {
+            const n1 = Number(s1 || 0);
+            const n2 = Number(s2 || 0);
+            if (n1 > 0 && n2 > 0) {
+              return Number(((n1 + n2) / 2).toFixed(2));
+            }
+            return n1 > 0 ? n1 : n2;
+          };
+
+          existing.p1_score = mergeIndexScore(existing.p1_score, row.p1_score);
+          existing.p2_score = mergeIndexScore(existing.p2_score, row.p2_score);
+          existing.p3_score = mergeIndexScore(existing.p3_score, row.p3_score);
+          existing.total_score = Number((Number(existing.p1_score || 0) + Number(existing.p2_score || 0) + Number(existing.p3_score || 0)).toFixed(2));
+          existing.p1_priority = Number(existing.p1_priority || 0) + Number(row.p1_priority || 0);
+          existing.p2_priority = Number(existing.p2_priority || 0) + Number(row.p2_priority || 0);
+          existing.p3_priority = Number(existing.p3_priority || 0) + Number(row.p3_priority || 0);
+          existing.total_priority_score = Number(existing.total_priority_score || 0) + Number(row.total_priority_score || 0);
+          existing.total_activity = Number(existing.total_activity || 0) + Number(row.total_activity || 0);
+          existing.total_activity_rupiah = Number(existing.total_activity_rupiah || 0) + Number(row.total_activity_rupiah || 0);
+          existing.pir_value = Number(existing.pir_value || 0) + Number(row.pir_value || 0);
+          existing.index_incentive = Number(existing.index_incentive || 0) + Number(row.index_incentive || 0);
+          existing.guarantee_fee = Number(existing.guarantee_fee || 0) + Number(row.guarantee_fee || 0);
+          existing.gross_incentive = Number((Number(existing.gross_incentive || 0) + Number(row.gross_incentive || 0)).toFixed(2));
+          existing.tax_amount = Number((Number(existing.tax_amount || 0) + Number(row.tax_amount || 0)).toFixed(2));
+          existing.net_incentive = Number((Number(existing.net_incentive || 0) + Number(row.net_incentive || 0)).toFixed(2));
+
+          existing.unit_allocation = Number((Number(existing.unit_allocation || 0) + Number(row.unit_allocation || 0)).toFixed(2));
+          existing.unit_total_activity = Number((Number(existing.unit_total_activity || 0) + Number(row.unit_total_activity || 0)).toFixed(2));
+
+          // Handle proportion safely. If they differ, stringify them nicely (e.g. "0.22% / 0.15%").
+          const formatProp = (val: any) => {
+            if (typeof val === 'string' && val.includes('%')) return val; // Already formatted
+            return val ? `${Number(val).toFixed(2)}%` : '0.00%';
+          }
+          if (existing.unit_proportion && row.unit_proportion && existing.unit_proportion !== row.unit_proportion) {
+            existing.unit_proportion = `${formatProp(existing.unit_proportion)} / ${formatProp(row.unit_proportion)}`;
+          } else {
+            existing.unit_proportion = existing.unit_proportion || row.unit_proportion;
+          }
+
+          if (existing.assessment_details && row.assessment_details) {
+            existing.assessment_details = [...existing.assessment_details, ...row.assessment_details];
+          } else {
+            existing.assessment_details = existing.assessment_details || row.assessment_details;
+          }
+          if (existing.p1_breakdown && row.p1_breakdown) {
+            existing.p1_breakdown = [...existing.p1_breakdown, ...row.p1_breakdown];
+          } else {
+            existing.p1_breakdown = existing.p1_breakdown || row.p1_breakdown;
+          }
+          if (existing.p2_breakdown && row.p2_breakdown) {
+            existing.p2_breakdown = [...existing.p2_breakdown, ...row.p2_breakdown];
+          } else {
+            existing.p2_breakdown = existing.p2_breakdown || row.p2_breakdown;
+          }
+          if (existing.p3_breakdown && row.p3_breakdown) {
+            existing.p3_breakdown = [...existing.p3_breakdown, ...row.p3_breakdown];
+          } else {
+            existing.p3_breakdown = existing.p3_breakdown || row.p3_breakdown;
+          }
+        } else {
+          mergedMap.set(id, { ...row });
+        }
+      }
+      return Array.from(mergedMap.values());
+    }
+
+    switch (reportType) {
+      case 'incentive':
+        if (revenueType === 'all') {
+          const bpjs = await generateIncentiveReport(supabase, period, unitId, employeeId, 'bpjs')
+          const umum = await generateIncentiveReport(supabase, period, unitId, employeeId, 'umum')
+          data = _mergeIncentives(bpjs, umum)
+        } else {
+          data = await generateIncentiveReport(supabase, period, unitId, employeeId, revenueType)
+        }
+        break
+      case 'kpi-achievement':
+        data = await generateKPIAchievementReport(supabase, period, unitId, employeeId, detailLevel, revenueType)
+        break
+      case 'unit-comparison':
+        data = await generateUnitComparisonReport(supabase, period, unitId, revenueType)
+        break
+      case 'employee-slip':
+        if (revenueType === 'all') {
+          const bpjsSlip = await generateEmployeeSlipReport(supabase, period, unitId, employeeId, 'bpjs')
+          const umumSlip = await generateEmployeeSlipReport(supabase, period, unitId, employeeId, 'umum')
+          data = _mergeIncentives(bpjsSlip, umumSlip)
+        } else {
+          data = await generateEmployeeSlipReport(supabase, period, unitId, employeeId, revenueType)
+        }
+        break
+      default:
+        return NextResponse.json(
+          { error: 'Invalid report type' },
+          { status: 400 }
+        )
+    }
+
+    // Check if data is empty (Requirement 12.7)
+    // Build summary metadata for selected unit/period
+    const effectiveUnitId = unitId && unitId !== 'all' ? unitId : null
+    let totalEmployeesInUnit = 0
+    let assessedCount = 0
+    let notAssessedCount = 0
+    let completionPercentage = 0
+
+    try {
+      // --- Summary Logic Sync ---
+      const { count: snapCount } = await supabase
+        .from('t_employee_period_snapshots')
+        .select('id', { count: 'exact', head: true })
+        .eq('period', period)
+
+      const useSnap = Boolean(snapCount && snapCount > 0)
+
+      let empListQuery = useSnap
+        ? supabase
+            .from('t_employee_period_snapshots')
+            .select('employee_id, unit_id, role, is_active, m_units!inner(kpi_schema_mode, code, name)')
+            .eq('period', period)
+            .eq('is_active', true)
+            .neq('role', 'superadmin')
+            .neq('m_units.code', 'ADMIN')
+        : supabase
+            .from('m_employees')
+            .select('id, unit_id, role, is_active, m_units!inner(kpi_schema_mode, code, name)')
+            .eq('is_active', true)
+            .neq('role', 'superadmin')
+            .neq('m_units.code', 'ADMIN')
+
+      if (effectiveUnitId) {
+        empListQuery = empListQuery.eq('unit_id', effectiveUnitId)
+      }
+
+      const { data: rawUnitEmployees, error: unitEmpErr } = await empListQuery.range(0, 9999)
+      if (unitEmpErr) console.error('[Summary] Error fetching employees:', unitEmpErr)
+
+      const unitEmployees = (rawUnitEmployees || [])
+        .filter((item: any) => {
+          if (item.role === 'superadmin') return false
+          if (item.is_active === false) return false
+          const unit = Array.isArray(item.m_units) ? item.m_units[0] : item.m_units
+          const code = String(unit?.code || '').toUpperCase()
+          const name = String(unit?.name || '').toUpperCase()
+          if (code === 'ADMIN' || code === 'SUPERADMIN' || name.includes('SUPERADMIN')) return false
+          return true
+        })
+        .map((e: any) => ({
+          ...e,
+          id: useSnap ? e.employee_id : e.id
+        }))
+
+      const unitEmpIds = unitEmployees.map((e: any) => e.id)
+      const unitEmpIdSet = new Set(unitEmpIds)
+      totalEmployeesInUnit = unitEmpIds.length
+      console.log(`[Summary] Found ${totalEmployeesInUnit} candidate employees for unit ${effectiveUnitId} in period ${period}`)
+
+      if (totalEmployeesInUnit > 0) {
+        // Use fast period query to handle all units and large sets without URL overflow or timeouts
+        try {
+          const targetRev = revenueType && revenueType !== 'all' ? (revenueType === 'umum' ? null : revenueType) : null
+          const assessedEmps = await fetchPeriodAssessmentsFast(
+            supabase,
+            'employee_id, revenue_type',
+            period,
+            targetRev,
+            false,
+            effectiveUnitId ? unitEmpIds : undefined
+          )
+
+          let validAssessedIds = new Set<string>()
+
+          if (revenueType === 'umum') {
+            const hasUmum = new Set(assessedEmps.filter((a: any) => a.revenue_type === 'umum').map((a: any) => a.employee_id))
+            const hasBpjs = new Set(assessedEmps.filter((a: any) => a.revenue_type === 'bpjs').map((a: any) => a.employee_id))
+
+            unitEmployees?.forEach((emp: any) => {
+              const uData = Array.isArray(emp.m_units) ? emp.m_units[0] : emp.m_units
+              const schemaMode = uData?.kpi_schema_mode || 'same'
+              if (schemaMode === 'different') {
+                if (hasUmum.has(emp.id)) {
+                  validAssessedIds.add(emp.id)
+                }
+              } else {
+                if (hasUmum.has(emp.id) || hasBpjs.has(emp.id)) {
+                  validAssessedIds.add(emp.id)
+                }
+              }
+            })
+          } else {
+            (assessedEmps || []).forEach((a: any) => {
+              if (unitEmpIdSet.has(a.employee_id)) {
+                validAssessedIds.add(a.employee_id)
+              }
+            })
+          }
+
+          assessedCount = validAssessedIds.size
+          console.log(`[Summary] Period ${period}: Found ${assessedCount} unique assessed employees out of ${totalEmployeesInUnit}`)
+        } catch (assessErr) {
+          console.error('[Summary] Error fetching assessments:', assessErr)
+        }
+      } else {
+        assessedCount = 0
+      }
+      // ----------------------------------------
+
+      notAssessedCount = totalEmployeesInUnit - assessedCount
+      if (notAssessedCount < 0) notAssessedCount = 0
+      completionPercentage = totalEmployeesInUnit > 0
+        ? Math.round((assessedCount / totalEmployeesInUnit) * 100)
+        : 0
+      // Final check for empty results to provide clear feedback
+      if (data.length === 0) {
+        console.log(`[Report] No data generated for unit ${unitId}, period ${period}`)
+        return NextResponse.json({
+          success: true,
+          data: [],
+          summary: {
+            period,
+            unit_name: unitId || 'Semua Unit',
+            total_employees: 0,
+            total_assessed: 0,
+            total_displayed: 0,
+            completion_percentage: 0
+          },
+          message: `Tidak ada data penilaian yang ditemukan untuk unit ${unitId || 'terpilih'} pada periode ${period}.`
+        })
+      }
+
+      // 3. Count unique employees in 'KEPERAWATAN' with assessments in '2026-05'
+      // CRITICAL: Synchronize summary counts with the actual report data
+      // The "Sudah Dinilai" and "Ditampilkan" counts must match the final data length
+      const reportRows = data.length;
+
+      const summary = {
+        period,
+        unit_name: data[0]?.unit || 'Semua Unit',
+        total_employees: totalEmployeesInUnit,
+        total_assessed: assessedCount, // Use the real count from database
+        total_displayed: data.length,   // Use the actually generated report length
+        completion_percentage: totalEmployeesInUnit > 0 ? Math.round((assessedCount / totalEmployeesInUnit) * 100) : 100
+      };
+
+      // Sanitize data before sending to client
+      const sanitizedData = data.map((row: any) => {
+        const clean: any = {}
+        for (const key in row) {
+          const value = row[key]
+          if (value === null || value === undefined) {
+            clean[key] = value
+          } else if (Array.isArray(value) || typeof value === 'object') {
+            try {
+              clean[key] = JSON.stringify(value)
+            } catch (e) {
+              clean[key] = '[Complex Object]'
+            }
+          } else {
+            clean[key] = value
+          }
+        }
+        return clean
+      })
+
+      return NextResponse.json({
+        success: true,
+        data: sanitizedData,
+        summary
+      })
+    } catch (summaryErr) {
+      console.error('Error building summary:', summaryErr)
+    }
+
+    return NextResponse.json({ success: true, data: [], message: 'Fallback triggered' })
+  } catch (error: any) {
+    console.error('Report generation error:', error)
+    return NextResponse.json(
+      { error: (error as Error).message },
+      { status: 500 }
+    )
+  }
+}
+
+/**
+ * Generate Incentive Report
+ * Uses PIR (Poin Indeks Rupiah) formula:
+ * PIR = (net_pool × proportion_unit%) / Total_Skor_Kolektif_Unit
+ * Bruto = Skor_Individu × PIR
+ * Netto = Bruto - PPh21
+ */
+async function generateIncentiveReport(supabase: any, period: string, unitId?: string, employeeId?: string, revenueType: string = 'all') {
+  // 1. Get Pool
+  const { data: poolData, error: poolError } = await supabase
+    .from('t_pool')
+    .select('net_pool, allocated_bpjs, allocated_umum, revenue_bpjs, revenue_umum, revenue_total')
+    .eq('period', period)
+    .maybeSingle()
+
+  if (!poolData) {
+    throw new Error(`Data pool tidak ditemukan untuk periode ${period}. Silakan buat data pool terlebih dahulu di menu Pengaturan Pool.`);
+  }
+
+  // 1.5 Get Global Tax Mechanism
+  const { data: taxSetting } = await supabase
+    .from('t_settings')
+    .select('value')
+    .eq('key', 'tax_config')
+    .maybeSingle()
+
+  const taxMechanism = (taxSetting?.value as any)?.mechanism || 'ter'
+
+  let netPool = Number(poolData.revenue_total || poolData.net_pool || 0);
+  if (revenueType === 'bpjs') {
+    netPool = Number(poolData.revenue_bpjs || poolData.allocated_bpjs || poolData.net_pool || 0);
+  } else if (revenueType === 'umum') {
+    netPool = Number(poolData.revenue_umum || poolData.allocated_umum || poolData.net_pool || 0);
+  }
+
+  // 2. Fetch active employees (fetch full unit to ensure accurate unitTotalScore and PIR calculations)
+  const { count: snapCount } = await supabase
+    .from('t_employee_period_snapshots')
+    .select('id', { count: 'exact', head: true })
+    .eq('period', period)
+
+  const useSnap = Boolean(snapCount && snapCount > 0)
+
+  let empQuery = useSnap
+    ? supabase
+        .from('t_employee_period_snapshots')
+        .select('*, m_units(id, name, proportion_percentage, proportion_umum_percentage, use_same_proportion, kpi_schema_mode)')
+        .eq('period', period)
+        .eq('is_active', true)
+        .neq('role', 'superadmin')
+    : supabase
+        .from('m_employees')
+        .select('*, m_units(id, name, proportion_percentage, proportion_umum_percentage, use_same_proportion, kpi_schema_mode)')
+        .eq('is_active', true)
+        .neq('role', 'superadmin')
+
+  if (unitId && unitId !== 'all') {
+    empQuery = empQuery.eq('unit_id', unitId)
+  } else if (employeeId && employeeId !== 'all') {
+    let targetUnitId: string | null = null
+    if (useSnap) {
+      const { data: targetSnap } = await supabase
+        .from('t_employee_period_snapshots')
+        .select('unit_id')
+        .eq('period', period)
+        .eq('employee_id', employeeId)
+        .maybeSingle()
+      targetUnitId = targetSnap?.unit_id || null
+    }
+    if (!targetUnitId) {
+      const { data: targetEmp } = await supabase.from('m_employees').select('unit_id').eq('id', employeeId).maybeSingle()
+      targetUnitId = targetEmp?.unit_id || null
+    }
+    if (targetUnitId) {
+      empQuery = empQuery.eq('unit_id', targetUnitId)
+    }
+  }
+
+  const { data: rawAllEmployees, error: allEmpError } = await empQuery.range(0, 9999)
+  const allEmployees = (rawAllEmployees || [])
+    .filter((e: any) => {
+      if (e.role === 'superadmin') return false
+      if (e.is_active === false) return false
+      const unit = Array.isArray(e.m_units) ? e.m_units[0] : e.m_units
+      const code = String(unit?.code || '').toUpperCase()
+      const name = String(unit?.name || '').toUpperCase()
+      if (code === 'ADMIN' || code === 'SUPERADMIN' || name.includes('SUPERADMIN')) return false
+      return true
+    })
+    .map((e: any) => ({
+      ...e,
+      id: useSnap ? e.employee_id : e.id
+    }))
+  console.log(`[Report] generateIncentiveReport: Fetched ${allEmployees?.length || 0} employees candidates for unit ${unitId}`)
+
+  // Fetch unit proportions locked/snapshotted for this specific period
+  const { data: periodUnitSnapshots } = await supabase
+    .from('t_unit_period_snapshots')
+    .select('unit_id, proportion_percentage, proportion_umum_percentage, use_same_proportion')
+    .eq('period', period)
+
+  const periodUnitPropMap = new Map<string, {
+    proportion_percentage: number
+    proportion_umum_percentage: number
+    use_same_proportion: boolean
+  }>()
+
+  if (periodUnitSnapshots && periodUnitSnapshots.length > 0) {
+    periodUnitSnapshots.forEach((s: any) => {
+      const bpjs = Number(s.proportion_percentage || 0)
+      const useSame = s.use_same_proportion !== false
+      const umum = useSame
+        ? bpjs
+        : (s.proportion_umum_percentage !== null && s.proportion_umum_percentage !== undefined ? Number(s.proportion_umum_percentage) : bpjs)
+      periodUnitPropMap.set(s.unit_id, {
+        proportion_percentage: bpjs,
+        proportion_umum_percentage: umum,
+        use_same_proportion: useSame
+      })
+    })
+  }
+
+  if (allEmpError) {
+    console.error('Error fetching employees:', allEmpError)
+    throw new Error('Failed to fetch employee data: ' + JSON.stringify(allEmpError))
+  }
+
+  if (!allEmployees || allEmployees.length === 0) {
+    console.log(`[Report] No employees found for unit: ${unitId}, emp: ${employeeId}`)
+    return []
+  }
+
+  const empIds = allEmployees.map((e: any) => e.id)
+  console.log(`[Report] Starting assessment fetch for ${empIds.length} employees in period ${period}`)
+
+  // 3. Get assessments for the filtered employees in this period
+  // Optimized: fetch minimal flat columns from t_kpi_assessments and join cached KPI metadata
+  // in memory (~65% less Supabase egress, 100% identical object structure & formulas!)
+  const kpiMeta = await getCachedKpiMetadata(supabase)
+
+  const mainSelectFields = `id,employee_id,indicator_id,sub_indicator_id,revenue_type,score,weight_percentage,achievement_percentage,realization_value,created_at,updated_at,target_value,is_contract,contract_percentage`
+  const subSelectFields = `id,employee_id,indicator_id,score,realization_value,sub_indicator_id,revenue_type,is_contract,contract_percentage`
+
+  const attachIndicatorMeta = (rows: any[]) =>
+    rows.map((r: any) => ({
+      ...r,
+      m_kpi_indicators: kpiMeta.indicatorsMap.get(r.indicator_id) || null
+    }))
+
+  const attachSubMeta = (rows: any[]) =>
+    rows.map((r: any) => ({
+      ...r,
+      m_kpi_sub_indicators: kpiMeta.subIndicatorsMap.get(r.sub_indicator_id) || null
+    }))
+
+  // Determine if we need BPJS fallback for same-schema units when generating UMUM report
+  const needBpjsFallback = revenueType === 'umum'
+
+  // Fetch unit schema modes from cache
+  let allUnitIds: Set<string> = new Set()
+  if (needBpjsFallback) {
+    const unitsSchema = await getOrSetCache('m_units:schemas', 120_000, async () => {
+      const { data } = await supabase.from('m_units').select('id, kpi_schema_mode')
+      return data || []
+    })
+    unitsSchema?.forEach((u: any) => {
+      allUnitIds.add(u.id)
+    })
+  }
+
+  let [rawMainAssessments, rawSubAssessments] = await Promise.all([
+    fetchPeriodAssessmentsFast(
+      supabase,
+      mainSelectFields,
+      period,
+      revenueType && revenueType !== 'all' ? revenueType : null,
+      false,
+      unitId && unitId !== 'all' ? empIds : undefined
+    ),
+    fetchPeriodAssessmentsFast(
+      supabase,
+      subSelectFields,
+      period,
+      revenueType && revenueType !== 'all' ? revenueType : null,
+      true,
+      unitId && unitId !== 'all' ? empIds : undefined
+    )
+  ])
+
+  let allAssessments = attachIndicatorMeta(rawMainAssessments)
+  let subAssessments = attachSubMeta(rawSubAssessments)
+
+  const empUnitMap = new Map<string, { unitId: string; schemaMode: string }>()
+  for (const emp of allEmployees || []) {
+    const unitData = Array.isArray(emp.m_units) ? emp.m_units[0] : emp.m_units
+    if (unitData?.id) {
+      empUnitMap.set(emp.id, { unitId: unitData.id, schemaMode: unitData.kpi_schema_mode })
+    }
+  }
+
+  // Bidirectional fallback between UMUM and BPJS:
+  // If generating report for one revenue type (e.g. BPJS or UMUM), for employees or indicators
+  // that have NO assessment in that revenue type (or have priority/potongan assessments saved in the other revenue type),
+  // fetch assessment data from the opposite revenue type as a fallback so calculations are accurate.
+  // NOTE: For units with kpi_schema_mode === 'different', do NOT fall back across revenues as indicator schemas are distinct!
+  const oppositeRevenue = revenueType === 'bpjs' ? 'umum' : revenueType === 'umum' ? 'bpjs' : null
+
+  // Only fetch opposite revenue if at least one employee belongs to a non-'different' schema unit
+  const hasSameSchemaEmp = Array.from(empUnitMap.values()).some(u => u.schemaMode !== 'different')
+
+  if (oppositeRevenue && allEmployees && allEmployees.length > 0 && hasSameSchemaEmp) {
+    const [rawOppositeMain, rawOppositeSub] = await Promise.all([
+      fetchPeriodAssessmentsFast(
+        supabase,
+        mainSelectFields,
+        period,
+        oppositeRevenue,
+        false,
+        unitId && unitId !== 'all' ? empIds : undefined
+      ),
+      fetchPeriodAssessmentsFast(
+        supabase,
+        subSelectFields,
+        period,
+        oppositeRevenue,
+        true,
+        unitId && unitId !== 'all' ? empIds : undefined
+      )
+    ])
+
+    const oppositeMain = attachIndicatorMeta(rawOppositeMain)
+    const oppositeSub = attachSubMeta(rawOppositeSub)
+
+    // O(1) index lookup maps (replaces O(N^2) findIndex scans)
+    const mainIndexMap = new Map<string, number>()
+    for (let i = 0; i < allAssessments.length; i++) {
+      const a = allAssessments[i]
+      const k = `${a.employee_id}:${a.indicator_id}`
+      if (!mainIndexMap.has(k)) mainIndexMap.set(k, i)
+    }
+
+    // 1. Add main assessments from opposite revenue type if missing or if opposite has non-zero priority deduction
+    for (const opp of oppositeMain) {
+      const uInfo = empUnitMap.get(opp.employee_id)
+      if (uInfo?.schemaMode === 'different') continue // Do not mix cross-revenue indicators for different schema units!
+
+      const key = `${opp.employee_id}:${opp.indicator_id}`
+      const existingIdx = mainIndexMap.get(key)
+
+      if (existingIdx === undefined) {
+        mainIndexMap.set(key, allAssessments.length)
+        allAssessments.push(opp)
+      } else {
+        // If existing assessment has 0 realization but opposite has non-zero realization (e.g. potongan), override/use fallback
+        const existing = allAssessments[existingIdx]
+        if (Number(existing.realization_value || 0) === 0 && Number(opp.realization_value || 0) !== 0) {
+          allAssessments[existingIdx] = opp
+        }
+      }
+    }
+
+    const subIndexMap = new Map<string, number>()
+    for (let i = 0; i < subAssessments.length; i++) {
+      const a = subAssessments[i]
+      const k = `${a.employee_id}:${a.indicator_id}:${a.sub_indicator_id}`
+      if (!subIndexMap.has(k)) subIndexMap.set(k, i)
+    }
+
+    // 2. Add sub assessments from opposite revenue type if missing or if opposite has non-zero realization
+    for (const oppSub of oppositeSub) {
+      const uInfo = empUnitMap.get(oppSub.employee_id)
+      if (uInfo?.schemaMode === 'different') continue // Do not mix cross-revenue indicators for different schema units!
+
+      const key = `${oppSub.employee_id}:${oppSub.indicator_id}:${oppSub.sub_indicator_id}`
+      const existingIdx = subIndexMap.get(key)
+
+      if (existingIdx === undefined) {
+        subIndexMap.set(key, subAssessments.length)
+        subAssessments.push(oppSub)
+      } else {
+        const existing = subAssessments[existingIdx]
+        if (Number(existing.realization_value || 0) === 0 && Number(oppSub.realization_value || 0) !== 0) {
+          subAssessments[existingIdx] = oppSub
+        }
+      }
+    }
+  }
+
+  // Filter out orphaned or inactive assessment records that don't belong to the unit's active categories for the revenue type
+  try {
+    const { count: totalEmployeesDb } = await supabase
+      .from('m_employees')
+      .select('id', { count: 'exact', head: true })
+      .eq('is_active', true)
+      .neq('role', 'superadmin')
+
+    const { count: totalUnitsDb } = await supabase
+      .from('m_units')
+      .select('id', { count: 'exact', head: true })
+      .eq('is_active', true)
+      .neq('code', 'ADMIN')
+
+    const { data: activeCategories } = await supabase
+      .from('m_kpi_categories')
+      .select('id, unit_id, revenue_type')
+      .eq('is_active', true)
+
+    const { data: activeIndicators } = await supabase
+      .from('m_kpi_indicators')
+      .select('id, category_id')
+      .eq('is_active', true)
+
+    const activeCategoryMap = new Map<string, any>(activeCategories?.map((c: any) => [c.id, c]) || [])
+
+    const getActiveIndicatorSet = (unitId: string, schemaMode: string, targetRevenueType: string): Set<string> => {
+      const validIds = new Set<string>()
+      const isDiff = schemaMode === 'different'
+
+      activeIndicators?.forEach((ind: any) => {
+        const cat = activeCategoryMap.get(ind.category_id)
+        if (cat && cat.unit_id === unitId) {
+          if (isDiff) {
+            if (targetRevenueType === 'umum') {
+              if (cat.revenue_type === 'umum' || cat.revenue_type === 'all' || !cat.revenue_type) {
+                validIds.add(ind.id)
+              }
+            } else {
+              if (cat.revenue_type === 'bpjs' || cat.revenue_type === 'all' || !cat.revenue_type) {
+                validIds.add(ind.id)
+              }
+            }
+          } else {
+            validIds.add(ind.id)
+          }
+        }
+      })
+
+      return validIds
+    }
+
+    const preFilterAllCount = allAssessments.length
+    const preFilterSubCount = subAssessments.length
+
+    allAssessments = allAssessments.filter((a: any) => {
+      const info = empUnitMap.get(a.employee_id)
+      if (!info) return true
+
+      const targetRev = a.revenue_type || revenueType
+      const validSet = getActiveIndicatorSet(info.unitId, info.schemaMode, targetRev)
+      if (validSet.size > 0 && !validSet.has(a.indicator_id)) {
+        return false
+      }
+
+      const isPriority = a.m_kpi_indicators?.calculation_method === 'priority'
+      const hasRealization = Math.abs(Number(a.realization_value || 0)) > 0
+      if (isPriority || hasRealization) return true
+
+      return true
+    })
+
+    subAssessments = subAssessments.filter((s: any) => {
+      // Guard: Ensure sub_indicator belongs to the indicator (prevents duplicate zombie rows from foreign schemas)
+      if (s.m_kpi_sub_indicators?.indicator_id && s.m_kpi_sub_indicators.indicator_id !== s.indicator_id) {
+        return false
+      }
+
+      const info = empUnitMap.get(s.employee_id)
+      if (!info) return true
+
+      const targetRev = s.revenue_type || revenueType
+      const validSet = getActiveIndicatorSet(info.unitId, info.schemaMode, targetRev)
+      if (validSet.size > 0 && !validSet.has(s.indicator_id)) {
+        return false
+      }
+
+      const isPriority = s.m_kpi_sub_indicators?.measurement_type === 'quantitative' || Math.abs(Number(s.realization_value || 0)) > 0
+      if (isPriority) return true
+
+      return true
+    })
+
+    console.log(`[Report] Filtered main assessments: ${preFilterAllCount} -> ${allAssessments.length}, sub: ${preFilterSubCount} -> ${subAssessments.length}`)
+  } catch (filterErr: any) {
+    console.error('[Report] Error filtering active indicators:', filterErr)
+  }
+
+
+
+  console.log(`[Report] Fetched ${allAssessments.length} main and ${subAssessments.length} sub-assessments`)
+
+  // Pre-compute medical status for sub-assessment workaround
+  const empMedicalMap = new Map<string, boolean>()
+  for (const emp of allEmployees) {
+    const unitData = Array.isArray(emp.m_units) ? emp.m_units[0] : emp.m_units
+    empMedicalMap.set(emp.id, isMedicalUnit(unitData?.id, unitData?.name))
+  }
+
+  // Deduplicate sub-assessments by employee_id + indicator_id + sub_indicator_id
+  const uniqueSubMap = new Map<string, any>()
+  for (const s of subAssessments) {
+    if (s.m_kpi_sub_indicators?.indicator_id && s.m_kpi_sub_indicators.indicator_id !== s.indicator_id) {
+      continue
+    }
+
+    const key = `${s.employee_id}:${s.indicator_id}:${s.sub_indicator_id}`
+    const existing = uniqueSubMap.get(key)
+    if (!existing) {
+      uniqueSubMap.set(key, s)
+    } else {
+      const existingTime = new Date(existing.updated_at || existing.created_at || 0).getTime()
+      const newTime = new Date(s.updated_at || s.created_at || 0).getTime()
+      if (newTime > existingTime) {
+        uniqueSubMap.set(key, s)
+      }
+    }
+  }
+  const cleanSubAssessments = Array.from(uniqueSubMap.values())
+
+  // Build a lookup: employee_id+indicator_id → aggregated sub-assessment score & realization
+  // Used as fallback when main row score is null (legacy data)
+  const subScoreMap = new Map<string, { score: number; realization: number }>()
+  for (const sub of cleanSubAssessments) {
+    const key = `${sub.employee_id}:${sub.indicator_id}`
+    const existing = subScoreMap.get(key)
+    const isMed = empMedicalMap.get(sub.employee_id) || false
+
+    let effectiveScore = Number(sub.score || 0)
+
+    // Workaround: PostgreSQL sets generated score to 0 if target=0. 
+    // We must mathematically re-calculate it using realization_value * weight (just like the frontend does)
+    const measurementType = sub.m_kpi_sub_indicators?.measurement_type
+
+    if (measurementType === 'quantitative') {
+      const tariff = Number(sub.m_kpi_sub_indicators?.base_index_value || 1);
+      const realScore = Number(sub.realization_value || 0) * tariff;
+
+      // Retroactively fix score if DB just stored volume (where effectiveScore !== realScore and tariff has custom value/decimal)
+      if (Math.abs(realScore) > 0 && effectiveScore !== realScore && (Math.abs(tariff) > 1 || (tariff > 0 && Math.abs(tariff - 1) > 0.00001))) {
+        effectiveScore = realScore;
+      }
+
+      // Fallback for priority activity types saved incorrectly as 0
+      if (effectiveScore === 0 && Math.abs(realScore) > 0) {
+        effectiveScore = realScore;
+      }
+    } else {
+      // Re-hydrate qualitative (scoring) metric manually
+      const weight = Number(sub.m_kpi_sub_indicators?.weight_percentage || 0)
+
+      const mainAsses = allAssessments?.find((a: any) => a.employee_id === sub.employee_id && a.indicator_id === sub.indicator_id)
+      const isPriority = mainAsses?.m_kpi_indicators?.calculation_method === 'priority'
+
+      if (isPriority) {
+        const subBase = Number(sub.m_kpi_sub_indicators?.base_index_value || 0)
+        const realVal = Number(sub.score !== undefined && sub.score !== null && sub.score !== 0 ? sub.score : sub.realization_value || 0)
+        // For qualitative/scoring priority indicators, realization_value holds the direct score
+        // chosen from scoring criteria (e.g. Rp 100.000 for Kepala Ruang, Rp 50.000 for MOD).
+        // If realVal is already the full nominal value (realVal >= subBase or realVal > 10),
+        // do NOT multiply by subBase to prevent squaring into billions (e.g. 100.000 * 100.000 = 10 milyar).
+        if (subBase > 1 && realVal < subBase && realVal <= 10) {
+          effectiveScore = realVal * subBase
+        } else {
+          effectiveScore = realVal
+        }
+      } else {
+        // Qualitative non-priority sub-indicator (e.g. BOR with sub-weights):
+        // Each sub-indicator's contribution to the indicator is subScore * (subWeight / 100)
+        // (in medical units, weight acts as 1)
+        const rawScore = Number(sub.score !== undefined && sub.score !== null && sub.score !== 0 ? sub.score : sub.realization_value || 0)
+        effectiveScore = rawScore * (isMed ? 1 : (weight / 100))
+      }
+    }
+
+    if (existing) {
+      existing.score += effectiveScore
+      existing.realization += Number(sub.realization_value || 0)
+    } else {
+      subScoreMap.set(key, {
+        score: effectiveScore,
+        realization: Number(sub.realization_value || 0)
+      })
+    }
+  }
+
+  if (!allEmployees) return []
+
+  // --- Helper: Calculate total score/activity for an employee ---
+  const calcEmployeeTotalScore = (empId: string, isMedicalUnit: boolean, uId?: string, unitName?: string) => {
+    let rawEmpAssessments = allAssessments?.filter((a: any) => a.employee_id === empId) || []
+
+    // Deduplicate main assessments to prevent score inflation from race-condition duplicate inserts
+    const uniqueMap = new Map<string, any>()
+    for (const a of rawEmpAssessments) {
+      const key = a.indicator_id || a.id
+      const existing = uniqueMap.get(key)
+      if (!existing) {
+        uniqueMap.set(key, a)
+      } else {
+        const existingTime = new Date(existing.updated_at || existing.created_at || 0).getTime()
+        const newTime = new Date(a.updated_at || a.created_at || 0).getTime()
+        if (newTime > existingTime) {
+          uniqueMap.set(key, a)
+        }
+      }
+    }
+    const empAssessments = Array.from(uniqueMap.values())
+
+    let totalActivityRupiah = 0
+    let totalDeductionRupiah = 0
+    const assessmentDetails: any[] = []
+    const processedIndices = new Set<string>()
+
+    const calcCategoryScore = (categoryName: string) => {
+      const targetCat = categoryName.trim().toUpperCase()
+      const catAssessments = empAssessments.filter((a: any) => {
+        const catObj = a.m_kpi_indicators?.m_kpi_categories
+        const cat = (catObj?.category || '').trim().toUpperCase()
+        const catUnit = catObj?.unit_id
+        const belongsToUnit = !catUnit || !uId || catUnit === uId
+        if (!belongsToUnit || (cat !== targetCat && !cat.startsWith(targetCat))) return false
+
+        const uInfo = empUnitMap.get(empId)
+        if (uInfo?.schemaMode === 'different') {
+          const catRev = catObj?.revenue_type
+          if (catRev && catRev !== 'all' && catRev !== revenueType) {
+            return false
+          }
+        }
+        return true
+      })
+
+      if (catAssessments.length === 0) {
+        return { indexScore: 0, priorityScore: 0 }
+      }
+
+      const firstCatObj = catAssessments[0]?.m_kpi_indicators?.m_kpi_categories
+      const categoryWeight = parseFloat(firstCatObj?.weight_percentage) || 0
+      const isWeightedCategory = firstCatObj?.is_weighted !== false
+
+      let totalRealisasiKategori = 0
+      let totalTargetKategori = 0
+      let priorityScore = 0
+
+      for (const a of catAssessments) {
+        // Mark as processed so we don't count it again in "others"
+        processedIndices.add(`${a.employee_id}:${a.indicator_id}`)
+
+        const indRealization = parseFloat(a.realization_value) || 0
+        const basicVal = parseFloat(a.m_kpi_indicators?.base_index_value) || 0
+        const rawScore = a.score  // already weighted metric from DB
+        const indName = a.m_kpi_indicators?.name || '-'
+        const indWeight = (a.m_kpi_indicators?.weight_percentage !== undefined && a.m_kpi_indicators?.weight_percentage !== null)
+          ? parseFloat(a.m_kpi_indicators.weight_percentage)
+          : (parseFloat(a.weight_percentage) || 0)
+        const indTarget = (a.m_kpi_indicators?.target_value !== undefined && a.m_kpi_indicators?.target_value !== null)
+          ? parseFloat(a.m_kpi_indicators.target_value)
+          : (parseFloat(a.target_value) || 0)
+        const calcMethod = a.m_kpi_indicators?.calculation_method || 'indexing'
+
+        const isPriority = calcMethod === 'priority'
+        const isActivity = isPriority || firstCatObj?.configuration_style === 'activity'
+
+        // Resolve effectiveScore: prefer sub-assessment aggregate, else if valid non-zero score in DB, else calculate
+        let effectiveScore: number
+        const subKey = `${empId}:${a.indicator_id}`
+        const subAgg = subScoreMap.get(subKey)
+
+        if (subAgg !== undefined && subAgg.score > 0) {
+          effectiveScore = subAgg.score
+        } else if (rawScore !== null && rawScore !== undefined && !isNaN(parseFloat(rawScore)) && parseFloat(rawScore) !== 0) {
+          effectiveScore = parseFloat(rawScore)
+        } else if (subAgg !== undefined) {
+          effectiveScore = subAgg.score
+        } else if (isActivity) {
+          if (basicVal > 1 && indRealization < basicVal && indRealization <= 10) {
+            effectiveScore = indRealization * basicVal
+          } else if (basicVal > 0) {
+            effectiveScore = indRealization * basicVal
+          } else {
+            effectiveScore = indRealization
+          }
+        } else if (rawScore !== null && rawScore !== undefined && !isNaN(parseFloat(rawScore))) {
+          effectiveScore = parseFloat(rawScore)
+
+          // Workaround: PostgreSQL generated score evaluates to 0 if target=0 (e.g. Qualitative indicators)
+          // The frontend mathematically rebuilds the score using realization_value * weight
+          if (effectiveScore === 0 && indRealization > 0) {
+            if (indTarget === 0) {
+              effectiveScore = indRealization * (isMedicalUnit ? 1 : (indWeight / 100))
+            }
+          }
+        } else if (indTarget > 0) {
+          const achPct = Math.min(100, (indRealization / indTarget) * 100)
+          effectiveScore = isMedicalUnit ? achPct : (achPct * (indWeight / 100))
+        } else {
+          effectiveScore = indRealization * (isMedicalUnit ? 1 : (indWeight / 100))
+        }
+
+        const indicatorScore = effectiveScore
+
+        const isDeduction = indicatorScore < 0
+
+        let activityValue = 0
+        if (isPriority && !isDeduction) {
+          activityValue = indicatorScore
+          priorityScore += activityValue
+        }
+
+        const detailScore = (!isMedicalUnit && isWeightedCategory && !isPriority)
+          ? indicatorScore * (indWeight / 100) * (categoryWeight / 100)
+          : indicatorScore
+
+        // Track detail for slip
+        assessmentDetails.push({
+          name: indName,
+          category: categoryName,
+          weight: indWeight,
+          target: indTarget,
+          realization: indRealization,
+          score: detailScore,
+          basic_value: basicVal,
+          calculation_method: calcMethod,
+          is_weighted: !isPriority,
+          is_activity: isPriority,
+          activity_value: activityValue,
+          is_priority: isPriority,
+          is_deduction: isDeduction
+        })
+
+        if (isDeduction) {
+          totalDeductionRupiah = Number(totalDeductionRupiah) + Math.abs(Number(indicatorScore))
+        } else if (isPriority) {
+          totalActivityRupiah = Number(totalActivityRupiah) + Number(activityValue)
+        } else {
+          if (isWeightedCategory) {
+            totalRealisasiKategori += (indicatorScore * (indWeight / 100))
+            totalTargetKategori += (indTarget * (indWeight / 100))
+          } else {
+            const ach = indTarget > 0 ? (indicatorScore / indTarget) * 100 : indicatorScore
+            totalRealisasiKategori += ach
+            totalTargetKategori += 100
+          }
+        }
+      }
+
+      let kontribusiAkhir = 0
+      if (totalTargetKategori > 0) {
+        if (isWeightedCategory) {
+          kontribusiAkhir = (totalRealisasiKategori / totalTargetKategori) * categoryWeight
+        } else {
+          kontribusiAkhir = (totalRealisasiKategori / totalTargetKategori) * 100
+        }
+      } else {
+        if (isWeightedCategory) {
+          kontribusiAkhir = totalRealisasiKategori * (categoryWeight / 100)
+        } else {
+          kontribusiAkhir = totalRealisasiKategori
+        }
+      }
+
+      const indexScore = isMedicalUnit ? totalRealisasiKategori : kontribusiAkhir
+
+      return { indexScore, priorityScore }
+    }
+
+    // Check contract status for Medis unit OR partial percentage for KEPERAWATAN, RADIOLOGI, REKAM MEDIK in BPJS & UMUM
+    const isPartialUnit = isPartialEligibleUnit(uId, unitName) && (revenueType === 'bpjs' || revenueType === 'umum')
+    let isContract = false
+    let contractPercentage = 100
+
+    if (isMedicalUnit) {
+      const assContract = rawEmpAssessments.find((a: any) => a.is_contract === true) || rawEmpAssessments.find((a: any) => a.is_contract !== null && a.is_contract !== undefined)
+      if (assContract) {
+        isContract = Boolean(assContract.is_contract)
+        if (assContract.contract_percentage !== null && assContract.contract_percentage !== undefined) {
+          contractPercentage = Number(assContract.contract_percentage)
+        }
+      } else {
+        const empRec = allEmployees.find((e: any) => e.id === empId)
+        if (empRec) {
+          isContract = Boolean(empRec.is_contract)
+          if (empRec.contract_percentage !== null && empRec.contract_percentage !== undefined) {
+            contractPercentage = Number(empRec.contract_percentage)
+          }
+        }
+      }
+    } else if (isPartialUnit) {
+      const assPartial = rawEmpAssessments.find((a: any) => a.is_contract === true)
+      if (assPartial) {
+        isContract = true
+        if (assPartial.contract_percentage !== null && assPartial.contract_percentage !== undefined) {
+          contractPercentage = Number(assPartial.contract_percentage)
+        }
+      }
+    }
+
+    const isMultiplierActive = (isMedicalUnit && isContract) || (isPartialUnit && isContract)
+    const contractMultiplier = isMultiplierActive ? (Math.max(0, contractPercentage) / 100) : 1
+
+    const p1Res = calcCategoryScore('P1')
+    const p2Res = calcCategoryScore('P2')
+    const p3Res = calcCategoryScore('P3')
+
+    const round2 = (num: number) => Number((Math.round((num + 1e-9) * 100) / 100).toFixed(2))
+
+    const p1 = round2(p1Res.indexScore * contractMultiplier)
+    const p2 = round2(p2Res.indexScore * contractMultiplier)
+    const p3 = round2(p3Res.indexScore * contractMultiplier)
+
+    const p1_priority = round2(p1Res.priorityScore)
+    const p2_priority = round2(p2Res.priorityScore)
+    const p3_priority = round2(p3Res.priorityScore)
+
+    const total_priority_score = round2(p1_priority + p2_priority + p3_priority)
+
+    // Also adjust assessmentDetails scores for indexing indicators if contractMultiplier !== 1
+    if (isMultiplierActive && contractMultiplier !== 1) {
+      for (const d of assessmentDetails) {
+        if (!d.is_priority && !d.is_activity) {
+          d.score = round2(d.score * contractMultiplier)
+        }
+      }
+    }
+
+    // Catch-all for assessments in other categories to ensure they are added to assessmentDetails
+    const remainingAssessments = empAssessments.filter((a: any) => {
+      if (processedIndices.has(`${a.employee_id}:${a.indicator_id}`)) return false
+      const catUnit = a.m_kpi_indicators?.m_kpi_categories?.unit_id
+      return !catUnit || !uId || catUnit === uId
+    })
+    for (const a of remainingAssessments) {
+      const indName = a.m_kpi_indicators?.name || '-'
+      const catName = a.m_kpi_indicators?.m_kpi_categories?.category || 'Lainnya'
+      const baseScore = parseFloat(a.score) || 0
+      const adjScore = (isMultiplierActive && contractMultiplier !== 1) ? round2(baseScore * contractMultiplier) : baseScore
+      assessmentDetails.push({
+        name: indName,
+        category: catName,
+        weight: parseFloat(a.m_kpi_indicators?.weight_percentage ?? a.weight_percentage) || 0,
+        target: parseFloat(a.m_kpi_indicators?.target_value ?? a.target_value) || 100,
+        realization: parseFloat(a.realization_value) || 0,
+        score: adjScore,
+        is_weighted: false,
+        is_activity: false,
+        activity_value: 0
+      })
+    }
+
+    return {
+      p1, p2, p3,
+      p1_priority, p2_priority, p3_priority,
+      total_priority_score,
+      totalScore: Number((p1 + p2 + p3).toFixed(2)),
+      totalActivityRupiah: Number(totalActivityRupiah),
+      totalDeductionRupiah: Number(totalDeductionRupiah),
+      assessmentDetails,
+      is_contract: isContract,
+      contract_percentage: contractPercentage
+    }
+  }
+
+  // --- First pass: calculate ALL employee scores and unit totals ---
+  const employeeScoresMap = new Map<string, {
+    emp: any;
+    p1: number;
+    p2: number;
+    p3: number;
+    p1_priority: number;
+    p2_priority: number;
+    p3_priority: number;
+    total_priority_score: number;
+    totalScore: number;
+    totalActivityRupiah: number;
+    totalDeductionRupiah: number;
+    assessmentDetails: any[];
+    is_contract?: boolean;
+    contract_percentage?: number;
+  }>()
+  const unitTotalScoresMap = new Map<string, number>()
+  const unitTotalActivityMap = new Map<string, number>()
+  const unitEmployeeCountMap = new Map<string, number>()
+
+  let skippedNoUnit = 0
+  for (const emp of allEmployees) {
+    if (!emp.m_units) {
+      skippedNoUnit++
+      continue
+    }
+    const unitData = Array.isArray(emp.m_units) ? emp.m_units[0] : emp.m_units
+    const uId = unitData?.id
+    const isMedical = isMedicalUnit(uId, unitData?.name)
+
+    const scores = calcEmployeeTotalScore(emp.id, isMedical, uId, unitData?.name)
+
+    employeeScoresMap.set(emp.id, { emp, ...scores })
+
+    const currentScoreSum = unitTotalScoresMap.get(uId) || 0
+    unitTotalScoresMap.set(uId, Math.round((currentScoreSum + Number(scores.totalScore || 0)) * 100) / 100)
+    unitTotalActivityMap.set(uId, Number(unitTotalActivityMap.get(uId) || 0) + Number(scores.totalActivityRupiah))
+    unitEmployeeCountMap.set(uId, Number(unitEmployeeCountMap.get(uId) || 0) + 1)
+  }
+  if (skippedNoUnit > 0) {
+    console.warn(`[Report] WARNING: Skipped ${skippedNoUnit} employees without unit data (m_units is null)`)
+  }
+
+  // --- Pre-fetch doctor guarantee fees upfront to prevent queries in loops ---
+  const doctorMasterMap = new Map<string, number>()
+  let totalGuaranteeFeeFromDocs = 0
+  try {
+    let remPeriodeUuid: string | null = null
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(period)
+    if (isUuid) {
+      remPeriodeUuid = period
+    } else {
+      const { data: remPer } = await supabase
+        .from('remunerasi_periode')
+        .select('id')
+        .eq('periode', period)
+        .maybeSingle()
+      remPeriodeUuid = remPer?.id || null
+    }
+
+    if (remPeriodeUuid) {
+      const { data: masterDocs } = await supabase
+        .from('remunerasi_master_dokter')
+        .select('employee_id, pagu_guarantee_fee')
+        .eq('periode_id', remPeriodeUuid)
+
+      if (masterDocs && masterDocs.length > 0) {
+        masterDocs.forEach((d: any) => {
+          const fee = Number(d.pagu_guarantee_fee || 0)
+          doctorMasterMap.set(d.employee_id, fee)
+          totalGuaranteeFeeFromDocs += fee
+        })
+      }
+    }
+  } catch (docErr) {
+    console.warn('[Report] Error pre-fetching doctor master:', docErr)
+  }
+
+  // --- Calculate PIR per unit and save audit trail ---
+  const unitPIRMap = new Map<string, number>()
+  const pirHistoriesToSave: any[] = []
+
+  for (const emp of allEmployees) {
+    if (!emp.m_units) continue
+    const unitData = Array.isArray(emp.m_units) ? emp.m_units[0] : emp.m_units
+    const uId = unitData?.id
+    if (!uId || unitPIRMap.has(uId)) continue
+
+    // Determine Style
+    const unitName = unitData?.name || '-'
+    const isMedical = isMedicalUnit(uId, unitName)
+
+    // Period-aware unit proportion (respects locked period proportion snapshots)
+    const snapProp = uId ? periodUnitPropMap.get(uId) : null
+    let propUmumVal: any
+    let propBPJSVal: any
+
+    if (snapProp) {
+      propBPJSVal = snapProp.proportion_percentage
+      propUmumVal = snapProp.use_same_proportion ? snapProp.proportion_percentage : snapProp.proportion_umum_percentage
+    } else {
+      propBPJSVal = unitData?.proportion_percentage || 0
+      propUmumVal = (unitData?.use_same_proportion !== false || !Number(unitData?.proportion_umum_percentage))
+        ? unitData?.proportion_percentage
+        : (unitData?.proportion_umum_percentage || unitData?.proportion_percentage || '0')
+    }
+
+    const unitProp = parseFloat(
+      revenueType === 'umum'
+        ? String(propUmumVal || '0')
+        : String(propBPJSVal || '0')
+    )
+    const totalSkorUnit = unitTotalScoresMap.get(uId) || 0
+    const empCount = unitEmployeeCountMap.get(uId) || 0
+    const allocatedForUnit = netPool * (unitProp / 100)
+
+    let pir = 0
+    const totalActivityValueUnit = unitTotalActivityMap.get(uId) || 0
+
+    if (isMedical) {
+      // MEDIS Style PIR Calculation: (Allocated - Aggregate Guarantee Fees - Total Activity Value) / Total Index Points
+      const sisaPaguMedis = allocatedForUnit - totalGuaranteeFeeFromDocs - totalActivityValueUnit
+      pir = (totalSkorUnit > 0 && sisaPaguMedis > 0) ? (sisaPaguMedis / totalSkorUnit) : 0
+    } else {
+      // STANDARD Style (Non-Medical) with Activity deduction:
+      // PIR = (AllocatedForUnit - TotalActivityValueUnit) / TotalSkorUnit
+      const remainingPool = allocatedForUnit - totalActivityValueUnit;
+      pir = (totalSkorUnit > 0) ? (remainingPool / totalSkorUnit) : 0;
+      // Allow slightly negative PIR if activities exceed allocation? Business logic check:
+      if (pir < 0) pir = 0;
+    }
+
+    // Keep full precision PIR in unitPIRMap for exact mathematical incentive calculations
+    unitPIRMap.set(uId, pir)
+
+    // Queue audit trail
+    pirHistoriesToSave.push({
+      period, uId, unitName,
+      netPool, unitProp, allocatedForUnit,
+      totalSkorUnit, pir, empCount
+    })
+  }
+
+  // Save all PIR histories in parallel
+  if (pirHistoriesToSave.length > 0) {
+    Promise.allSettled(
+      pirHistoriesToSave.map(h =>
+        savePIRHistory(
+          supabase, h.period, h.uId, h.unitName,
+          h.netPool, h.unitProp, h.allocatedForUnit,
+          h.totalSkorUnit, h.pir, h.empCount
+        )
+      )
+    ).catch(e => console.warn('[Report] Non-critical error saving PIR histories:', e))
+  }
+
+  // --- Pre-compute unit total deductions and redistribution per unit ---
+  const unitTotalDeductionMap = new Map<string, number>()
+  const unitDeductedEmpCountMap = new Map<string, number>()
+  const unitTotalEmpCountMap = new Map<string, number>()
+
+  for (const [empId, data] of employeeScoresMap.entries()) {
+    const unitData = Array.isArray(data.emp.m_units) ? data.emp.m_units[0] : data.emp.m_units
+    const uId = unitData?.id
+    if (!uId) continue
+
+    const ded = Number(data.totalDeductionRupiah || 0)
+    unitTotalEmpCountMap.set(uId, (unitTotalEmpCountMap.get(uId) || 0) + 1)
+
+    if (ded > 0) {
+      unitTotalDeductionMap.set(uId, (unitTotalDeductionMap.get(uId) || 0) + ded)
+      unitDeductedEmpCountMap.set(uId, (unitDeductedEmpCountMap.get(uId) || 0) + 1)
+    }
+  }
+
+  const unitDistribusiPotonganPersonMap = new Map<string, number>()
+  for (const [uId, totalEmp] of unitTotalEmpCountMap.entries()) {
+    const totalDeduction = unitTotalDeductionMap.get(uId) || 0
+    const deductedEmpCount = unitDeductedEmpCountMap.get(uId) || 0
+    const nonDeductedEmpCount = totalEmp - deductedEmpCount
+
+    if (totalDeduction > 0 && nonDeductedEmpCount > 0) {
+      unitDistribusiPotonganPersonMap.set(uId, totalDeduction / nonDeductedEmpCount)
+    } else {
+      unitDistribusiPotonganPersonMap.set(uId, 0)
+    }
+  }
+
+  // --- Second pass: Calculate Gross/Net incentive per employee ---
+  const report = []
+
+  // Determine which employees to include in the report
+  const reportEmployeeIds = new Set<string>()
+  for (const emp of allEmployees) {
+    const matchUnit = !unitId || unitId === 'all' || emp.unit_id === unitId
+    const matchEmp = !employeeId || employeeId === 'all' || emp.id === employeeId
+    if (matchUnit && matchEmp) {
+      reportEmployeeIds.add(emp.id)
+    }
+  }
+
+  for (const [empId, data] of employeeScoresMap.entries()) {
+    if (!reportEmployeeIds.has(empId)) continue
+
+    const { emp, p1, p2, p3, p1_priority, p2_priority, p3_priority, total_priority_score, totalScore, totalActivityRupiah, totalDeductionRupiah, assessmentDetails } = data
+
+    // Relaxed condition: Include employee if they were fetched in our assessment queries.
+    // If they were in empIds and we fetched something (main or sub), they should be here.
+    // We already filtered allEmployees down to reportEmployeeIds.
+    // JUST check if they have at least one record in assessmentDetails OR if they were part of the assessments fetch.
+    const hasAnyAssessment = assessmentDetails.length > 0 || allAssessments.some(a => a.employee_id === empId) || subAssessments.some(s => s.employee_id === empId);
+
+    if (!hasAnyAssessment) continue
+
+    const unitData = Array.isArray(emp.m_units) ? emp.m_units[0] : emp.m_units
+    const uId = unitData?.id
+    const unitName = unitData?.name || '-'
+
+    // Period-aware unit proportion (respects locked period proportion snapshots)
+    const snapProp = uId ? periodUnitPropMap.get(uId) : null
+    let rowPropUmum: any
+    let rowPropBPJS: any
+
+    if (snapProp) {
+      rowPropBPJS = snapProp.proportion_percentage
+      rowPropUmum = snapProp.use_same_proportion ? snapProp.proportion_percentage : snapProp.proportion_umum_percentage
+    } else {
+      rowPropBPJS = unitData?.proportion_percentage || 0
+      rowPropUmum = (unitData?.use_same_proportion !== false || !Number(unitData?.proportion_umum_percentage))
+        ? unitData?.proportion_percentage
+        : (unitData?.proportion_umum_percentage || unitData?.proportion_percentage || '0')
+    }
+
+    const unitProp = parseFloat(
+      revenueType === 'umum'
+        ? String(rowPropUmum || '0')
+        : String(rowPropBPJS || '0')
+    )
+    const pir = uId ? (unitPIRMap.get(uId) || 0) : 0
+    const totalSkorUnit = uId ? (unitTotalScoresMap.get(uId) || 0) : 0
+
+    const isMedical = isMedicalUnit(uId, unitName)
+
+    // Formula: (Total Indeks x PIR) + Insentif Berbasis Prioritas + Distribusi Potongan Unit - Potongan
+    const indexIncentive = Number((totalScore * pir).toFixed(2))
+    const positiveActivity = Number(totalActivityRupiah)
+    const deductionAmount = Number(totalDeductionRupiah || 0)
+
+    // Calculate equal redistribution of unit deductions for non-deducted employees
+    let meDistribusiPotongan = 0
+    if (deductionAmount === 0 && uId) {
+      meDistribusiPotongan = unitDistribusiPotonganPersonMap.get(uId) || 0
+    }
+
+    let grossIncentiveBeforeDeduction = Number(indexIncentive) + positiveActivity + meDistribusiPotongan
+
+    let guaranteeFee = 0
+    if (isMedical) {
+      guaranteeFee = Number(doctorMasterMap.get(empId) || 0)
+      grossIncentiveBeforeDeduction += guaranteeFee
+    }
+
+    // Direct deduction from gross incentive
+    const grossIncentive = Math.max(0, grossIncentiveBeforeDeduction - deductionAmount)
+
+    // PPh 21
+    const taxCheck = calculatePPh21(
+      grossIncentive,
+      emp.employment_status || emp.employee_status,
+      emp.tax_type,
+      emp.tax_status,
+      emp.pns_grade,
+      taxMechanism as any
+    )
+
+    // Insentif Netto = Bruto - Pajak
+    const netIncentive = grossIncentive - taxCheck.amount
+
+    const mappedNik = emp.nik || emp.NIK || '-'
+    const mappedBankName = emp.bank_name || emp.BANK_NAME || emp.nama_bank || '-'
+    const mappedBankAccount = emp.bank_account_number || emp.BANK_ACCOUNT_NUMBER || emp.nomor_rekening || '-'
+    const mappedBankHolder = emp.bank_account_name || emp.BANK_ACCOUNT_NAME || emp.bank_account_holder || emp.full_name || '-'
+
+    // Extract category weights from assessmentDetails
+    const getCatWeight = (cat: string) => {
+      const detail = assessmentDetails.find((d: any) => d.category === cat)
+      if (!detail) return 0
+      // Get from the category metadata in allAssessments
+      const catAss = allAssessments?.find((a: any) => a.employee_id === empId && a.m_kpi_indicators?.m_kpi_categories?.category === cat)
+      return parseFloat(catAss?.m_kpi_indicators?.m_kpi_categories?.weight_percentage) || 0
+    }
+
+    report.push({
+      employee_id: empId,
+      employee_code: emp.employee_code || '-',
+      nik: mappedNik,
+      employee_name: emp.full_name,
+      unit: unitName,
+      bank_name: mappedBankName,
+      bank_account_number: mappedBankAccount,
+      bank_account_holder: mappedBankHolder,
+      tax_status: emp.tax_status || 'TK/0',
+      employee_status: (isMedical && data.is_contract)
+        ? `Kontrak (${data.contract_percentage}%)`
+        : (isPartialEligibleUnit(uId, unitName) && (revenueType === 'bpjs' || revenueType === 'umum') && data.is_contract)
+          ? `Sebagian (${data.contract_percentage}%)`
+          : (emp.employment_status || ((emp.employee_status === 'active' || emp.employee_status === 'ASN') ? 'ASN' : (emp.employee_status || 'BLUD'))),
+      is_contract: Boolean(data.is_contract),
+      contract_percentage: data.contract_percentage !== undefined ? data.contract_percentage : 100,
+      tax_type: (emp.tax_type === 'gross' || emp.tax_type === 'Final') ? 'Final' : (emp.tax_type || 'TER'),
+      pns_grade: (emp.pns_grade && emp.pns_grade !== 'null') ? emp.pns_grade : '-',
+      tax_mechanism_used: taxMechanism,
+      p1_score: p1,
+      p2_score: p2,
+      p3_score: p3,
+      p1_priority: p1_priority || 0,
+      p2_priority: p2_priority || 0,
+      p3_priority: p3_priority || 0,
+      total_priority_score: total_priority_score || positiveActivity || 0,
+      p1_weight: getCatWeight('P1'),
+      p2_weight: getCatWeight('P2'),
+      p3_weight: getCatWeight('P3'),
+      total_score: totalScore,
+      pir_value: pir,
+      total_activity: positiveActivity,
+      total_activity_rupiah: positiveActivity,
+      potongan: deductionAmount,
+      distribusi_potongan: meDistribusiPotongan,
+      index_incentive: indexIncentive,
+      guarantee_fee: guaranteeFee,
+      total_skor_unit: Number(totalSkorUnit),
+      unit_proportion: Number(unitProp),
+      unit_allocation: uId ? Number((Number(netPool) * (Number(unitProp) / 100)).toFixed(2)) : 0,
+      unit_total_activity: uId ? Number(unitTotalActivityMap.get(uId) || 0) : 0,
+      gross_incentive: Number(grossIncentive.toFixed(2)),
+      tax_amount: taxCheck.amount,
+      tax_detail: taxCheck.text,
+      net_incentive: Number(netIncentive.toFixed(2)),
+      assessment_details: assessmentDetails,
+    })
+  }
+
+  // --- Unit Allocation Reconciliation ---
+  // Ensure the sum of gross_incentive for each unit matches the unit_allocation exactly (down to the cent)
+  const unitReportRowsMap = new Map<string, any[]>()
+  for (const row of report) {
+    const uData = employeeScoresMap.get(row.employee_id)?.emp?.m_units
+    const uId = Array.isArray(uData) ? uData[0]?.id : uData?.id
+    if (!uId) continue
+    if (!unitReportRowsMap.has(uId)) unitReportRowsMap.set(uId, [])
+    unitReportRowsMap.get(uId)!.push(row)
+  }
+
+  for (const [uId, rows] of unitReportRowsMap.entries()) {
+    if (rows.length === 0) continue
+    const targetAlloc = rows[0].unit_allocation || 0
+    if (targetAlloc <= 0) continue
+
+    // Guard: Only reconcile when full unit report is generated (not for single employee filters)
+    const expectedCount = unitEmployeeCountMap.get(uId) || rows.length
+    if (employeeId && employeeId !== 'all') continue
+    if (rows.length < expectedCount) continue
+
+    const currentGrossSum = Number(rows.reduce((acc, r) => acc + (Number(r.gross_incentive) || 0), 0).toFixed(2))
+    const diff = Number((targetAlloc - currentGrossSum).toFixed(2))
+
+    // If there is any minute cent/sen rounding difference, reconcile it on the highest scoring employee row
+    if (Math.abs(diff) > 0 && Math.abs(diff) < 50) {
+      const topRow = rows.reduce((max, r) => (Number(r.total_score || 0) > Number(max.total_score || 0) ? r : max), rows[0])
+      topRow.gross_incentive = Number((Number(topRow.gross_incentive || 0) + diff).toFixed(2))
+      topRow.index_incentive = Number((Number(topRow.index_incentive || 0) + diff).toFixed(2))
+
+      const newTaxCheck = calculatePPh21(
+        topRow.gross_incentive,
+        topRow.employee_status,
+        topRow.tax_type,
+        topRow.tax_status,
+        topRow.pns_grade,
+        taxMechanism as any
+      )
+      topRow.tax_amount = newTaxCheck.amount
+      topRow.tax_detail = newTaxCheck.text
+      topRow.net_incentive = Number((topRow.gross_incentive - topRow.tax_amount).toFixed(2))
+    }
+  }
+
+async function saveRemunerasiHasil(supabase: any, period: string, netPool: number, report: any[]) {
+  try {
+    let { data: remPeriode } = await supabase
+      .from('remunerasi_periode')
+      .select('id')
+      .eq('periode', period)
+      .maybeSingle()
+
+    if (!remPeriode?.id) {
+      const { data: newP } = await supabase
+        .from('remunerasi_periode')
+        .insert({
+          periode: period,
+          total_pagu: netPool || 0,
+          status: 'calculated',
+          description: `Periode Remunerasi ${period}`
+        })
+        .select('id')
+        .single()
+      remPeriode = newP
+    }
+
+    if (remPeriode?.id && Array.isArray(report) && report.length > 0) {
+      const periodeId = remPeriode.id
+      const payload = report.map(row => ({
+        periode_id: periodeId,
+        employee_id: row.employee_id,
+        total_langsung: Number(row.total_activity || 0),
+        total_poin_indeks: Number(row.total_score || 0),
+        konversi_indeks_rupiah: Number(row.index_incentive || 0),
+        bruto: Number(row.gross_incentive || 0),
+        pajak_nominal: Number(row.tax_amount || 0),
+        netto: Number(row.net_incentive || 0),
+        pir_apply: Number(row.pir_value || 0)
+      }))
+
+      // Batch in chunks of 200 in parallel
+      const chunkSize = 200
+      const chunks: any[][] = []
+      for (let i = 0; i < payload.length; i += chunkSize) {
+        chunks.push(payload.slice(i, i + chunkSize))
+      }
+      await Promise.all(
+        chunks.map(chunk =>
+          supabase
+            .from('remunerasi_hasil')
+            .upsert(chunk, { onConflict: 'periode_id,employee_id' })
+            .then(({ error }: any) => {
+              if (error) console.error('Error batch upserting remunerasi_hasil chunk:', error.message)
+            })
+        )
+      )
+    }
+  } catch (err: any) {
+    console.error('Failed to save remunerasi_hasil:', err.message)
+  }
+}
+
+  // Sort by full name for better readability
+  report.sort((a, b) => (a.employee_name || '').localeCompare(b.employee_name || ''))
+
+  // Persist calculation results into remunerasi_hasil database table
+  if (!employeeId || employeeId === 'all') {
+    await saveRemunerasiHasil(supabase, period, Number(netPool || 0), report)
+  }
+
+  if (employeeId && employeeId !== 'all') {
+    return report.filter((r: any) => r.employee_id === employeeId)
+  }
+
+  return report
+}
+
+/**
+ * Generate KPI Achievement Report
+ * Averages out achievement per indicator across all employees in the period.
+ */
+async function generateKPIAchievementReport(supabase: any, period: string, unitId?: string, employeeId?: string, detailLevel?: string, revenueType: string = 'all') {
+  // Fetch Assessment Data - minimal flat columns, join employees & KPI metadata in-memory (~70% less egress!)
+  const kpiSelectFields = `realization_value,target_value,achievement_percentage,employee_id,indicator_id`
+  const kpiMeta = await getCachedKpiMetadata(supabase)
+
+  const allEmpsMap = await getOrSetCache<Map<string, any>>('reports:m_employees_basic_map', 120_000, async () => {
+    const { data } = await supabase
+      .from('m_employees')
+      .select('id, full_name, nik, m_units(name)')
+      .range(0, 9999)
+    const map = new Map<string, any>()
+    for (const e of data || []) {
+      map.set(e.id, e)
+    }
+    return map
+  })
+
+  let rawAssessments: any[] = []
+
+  // Check snapshot for period
+  const { count: snapCount } = await supabase
+    .from('t_employee_period_snapshots')
+    .select('id', { count: 'exact', head: true })
+    .eq('period', period)
+
+  const useSnap = Boolean(snapCount && snapCount > 0)
+  const empUnitNameMap = new Map<string, string>()
+
+  if (useSnap) {
+    const { data: snapEmpsWithUnit } = await supabase
+      .from('t_employee_period_snapshots')
+      .select('employee_id, m_units(name)')
+      .eq('period', period)
+      .range(0, 9999)
+
+    snapEmpsWithUnit?.forEach((s: any) => {
+      const u = Array.isArray(s.m_units) ? s.m_units[0] : s.m_units
+      if (u?.name) empUnitNameMap.set(s.employee_id, u.name)
+    })
+  }
+
+  if (unitId || employeeId) {
+    let empIds: string[] = []
+
+    if (useSnap) {
+      let q = supabase
+        .from('t_employee_period_snapshots')
+        .select('employee_id')
+        .eq('period', period)
+        .eq('is_active', true)
+        .neq('role', 'superadmin')
+
+      if (employeeId && employeeId !== 'all') {
+        q = q.eq('employee_id', employeeId)
+      } else if (unitId && unitId !== 'all') {
+        q = q.eq('unit_id', unitId)
+      }
+
+      const { data: emps } = await q.range(0, 9999)
+      empIds = (emps || []).map((e: any) => e.employee_id)
+    } else {
+      const matchCriteria: any = {}
+      if (employeeId && employeeId !== 'all') {
+        matchCriteria.id = employeeId
+      } else if (unitId && unitId !== 'all') {
+        matchCriteria.unit_id = unitId
+      }
+
+      const { data: emps } = await supabase
+        .from('m_employees')
+        .select('id')
+        .match(matchCriteria)
+        .range(0, 9999)
+
+      empIds = emps?.map((e: any) => e.id) || []
+    }
+
+    if (empIds.length === 0) return []
+
+    // Use batchedIn to avoid URL overflow with large employee sets
+    rawAssessments = await batchedIn(
+      supabase,
+      't_kpi_assessments',
+      kpiSelectFields,
+      'employee_id',
+      empIds,
+      q => {
+        let qry = q.eq('period', period).is('sub_indicator_id', null)
+        if (revenueType && revenueType !== 'all') qry = qry.eq('revenue_type', revenueType)
+        return qry
+      }
+    )
+  } else {
+    // No unit/employee filter — fetch paginated in parallel
+    rawAssessments = await fetchPeriodAssessmentsFast(
+      supabase,
+      kpiSelectFields,
+      period,
+      revenueType && revenueType !== 'all' ? revenueType : null,
+      false
+    )
+  }
+
+  // Attach m_employees & m_kpi_indicators in memory (identical shape to previous inner join)
+  const assessments = rawAssessments
+    .map((row: any) => {
+      const ind = kpiMeta.indicatorsMap.get(row.indicator_id)
+      if (!ind) return null
+      return {
+        ...row,
+        m_employees: allEmpsMap.get(row.employee_id) || null,
+        m_kpi_indicators: ind,
+      }
+    })
+    .filter(Boolean)
+
+  const assError = null // already handled above
+
+  if (assError) throw assError
+
+  // Merge Data
+  const mergedData = new Map()
+
+  assessments?.forEach((row: any) => {
+    const indicatorId = row.m_kpi_indicators.id
+    const empId = row.employee_id
+
+    // Group by employee AND indicator so we get individual reports in bulk
+    const key = `${indicatorId}_${empId}`
+
+    const existing = mergedData.get(key)
+    const empRecord = Array.isArray(row.m_employees) ? row.m_employees[0] : row.m_employees
+    const empName = empRecord?.full_name || '-'
+    const unitData = Array.isArray(empRecord?.m_units) ? empRecord?.m_units[0] : empRecord?.m_units
+    const unitName = empUnitNameMap.get(empId) || unitData?.name || '-'
+
+    const basicVal = parseFloat(row.m_kpi_indicators.base_index_value) || 0
+    const catStyle = row.m_kpi_indicators.m_kpi_categories?.configuration_style
+    const calcMethod = row.m_kpi_indicators.calculation_method || 'indexing'
+    const isWeightedCat = row.m_kpi_indicators.m_kpi_categories?.is_weighted !== false
+
+    const isActivity = catStyle === 'activity' || calcMethod === 'priority' || basicVal > 1
+
+    if (existing) {
+      existing.count++
+      existing.sum_realization += Number(row.realization_value || 0)
+      existing.sum_target_value += Number(row.target_value || row.m_kpi_indicators.target_value || 0)
+      existing.sum_score += Number(row.score || 0)
+    } else {
+      mergedData.set(key, {
+        category: row.m_kpi_indicators.m_kpi_categories?.category || '-',
+        indicator_name: row.m_kpi_indicators.name,
+        weight: row.m_kpi_indicators.weight_percentage,
+        employee_name: empName,
+        unit_name: unitName,
+        is_activity: isActivity,
+        is_weighted: isWeightedCat && !isActivity,
+        base_index_value: basicVal,
+        count: 1,
+        sum_realization: Number(row.realization_value || 0),
+        sum_target_value: Number(row.target_value || row.m_kpi_indicators.target_value || 0),
+        sum_score: Number(row.score || 0),
+      })
+    }
+  })
+
+  // Format array for report
+  const reportArray = Array.from(mergedData.values()).map(item => {
+    const realization = Number((item.sum_realization / item.count).toFixed(2));
+    const target = Number((item.sum_target_value / item.count).toFixed(2));
+    const avgScore = Number((item.sum_score / item.count).toFixed(2));
+
+    // Unify achievement logic with generateIncentiveReport: Target 0 means 100% achievement
+    const achievement_percentage = target === 0 ? 100 : (realization / target) * 100;
+
+    let score = 0;
+    if (item.is_activity) {
+      // Unify with incentive logic: value = score || (realization * base)
+      score = avgScore || (realization * (item.base_index_value || 0));
+    } else if (item.is_weighted) {
+      score = (achievement_percentage / 100) * item.weight;
+    } else {
+      score = achievement_percentage;
+    }
+
+    const gap = realization - target;
+
+    return {
+      category: item.category,
+      indicator_name: item.indicator_name,
+      target_value: target.toFixed(2),
+      weight: item.weight,
+      employee_name: item.employee_name,
+      unit_name: item.unit_name,
+      realization_value: realization.toFixed(2),
+      gap: gap.toFixed(2),
+      achievement_percentage: achievement_percentage.toFixed(2),
+      score: score.toFixed(2),
+      is_activity: item.is_activity
+    };
+  })
+
+  // Sort by Category (P1, P2, P3) then by Indicator
+  reportArray.sort((a, b) => {
+    if (a.category === b.category) {
+      return a.indicator_name.localeCompare(b.indicator_name);
+    }
+    return (a.category || '').localeCompare(b.category || '');
+  });
+
+  return reportArray
+}
+
+/**
+ * Generate Unit Comparison Report
+ * Uses the dynamically calculated incentive report data to aggregate by unit.
+ */
+async function generateUnitComparisonReport(supabase: any, period: string, unitId?: string, revenueType: string = 'all') {
+  // 1. Get Pool for Revenue
+  const { data: poolData } = await supabase
+    .from('t_pool')
+    .select('net_pool, allocated_bpjs, allocated_umum, revenue_bpjs, revenue_umum, revenue_total')
+    .eq('period', period)
+    .maybeSingle()
+
+  let netPool = Number(poolData?.revenue_total || poolData?.net_pool || 0);
+  if (revenueType === 'bpjs') {
+    netPool = Number(poolData?.revenue_bpjs || poolData?.allocated_bpjs || poolData?.net_pool || 0);
+  } else if (revenueType === 'umum') {
+    netPool = Number(poolData?.revenue_umum || poolData?.allocated_umum || poolData?.net_pool || 0);
+  }
+
+  // Reuse the dynamic incentive generation logic
+  const topLevelData = await generateIncentiveReport(supabase, period, unitId, 'all', revenueType)
+
+  // Aggregate by unit
+  const unitMap = new Map()
+
+  topLevelData.forEach(row => {
+    const uName = row.unit
+    if (!unitMap.has(uName)) {
+      let rawProp = typeof row.unit_proportion === 'string' ? parseFloat((row.unit_proportion as String).replace('%', '')) : Number(row.unit_proportion || 0)
+      if (isNaN(rawProp)) rawProp = 0;
+
+      unitMap.set(uName, {
+        unit_name: uName,
+        total_score_sum: 0,
+        total_activity_sum: 0,
+        employee_count: 0,
+        pir_value: row.pir_value || 0,
+        unit_proportion: rawProp,
+        unit_proportion_str: row.unit_proportion
+      })
+    }
+
+    const u = unitMap.get(uName)
+    u.total_score_sum += Number(row.total_score || 0)
+    u.total_activity_sum += Number(row.total_priority_score || row.total_activity_rupiah || row.total_activity || 0)
+    u.employee_count++
+  })
+
+  // Format Array
+  return Array.from(unitMap.values()).map(u => {
+    const calculatedIncentive = (u.unit_proportion / 100) * netPool;
+    return {
+      unit_name: u.unit_name,
+      unit_proportion: u.unit_proportion_str || `${u.unit_proportion.toFixed(2)}%`,
+      average_score: u.employee_count > 0 ? (u.total_score_sum / u.employee_count) : 0,
+      total_priority: u.total_activity_sum,
+      total_unit_score: u.total_score_sum,
+      total_unit_activity: u.total_activity_sum,
+      pir_value: u.pir_value,
+      total_incentive: calculatedIncentive,
+      employee_count: u.employee_count
+    }
+  })
+}
+
+/**
+ * Generate Employee Slip Report
+ * Uses enriched data from generateIncentiveReport including assessment_details and category weights.
+ */
+async function generateEmployeeSlipReport(supabase: any, period: string, unitId?: string, employeeId?: string, revenueType: string = 'all') {
+  // Reuse the dynamic total calculations (now includes assessment_details & weights)
+  const topLevelData = await generateIncentiveReport(supabase, period, unitId, employeeId, revenueType)
+
+  const results = []
+
+  for (const row of topLevelData) {
+    const details: any[] = row.assessment_details || []
+
+    // Use actual category weights from the data
+    const p1Weight = row.p1_weight || 0
+    const p2Weight = row.p2_weight || 0
+    const p3Weight = row.p3_weight || 0
+
+    // Build breakdown from assessment_details
+    const buildBreakdown = (category: string) => {
+      return details
+        .filter((d: any) => d.category === category)
+        .map((d: any) => {
+          const isPriority = d.is_priority || d.calculation_method === 'priority'
+
+          if (isPriority) {
+            // Use the pre-calculated activity_value (which correctly uses the score field for priority)
+            const actRupiah = Number(d.activity_value) || Number(d.score) || 0
+            return {
+              indicator: d.name,
+              target: '-',
+              weight: 'N/A',
+              achievement: d.realization.toString(),
+              score: actRupiah.toFixed(2),
+              is_activity: true,
+              tarif: d.basic_value,
+            }
+          }
+
+          const achievementVal = (Number(d.target) > 0 ? ((Number(d.realization) / Number(d.target)) * 100) : 0)
+
+          return {
+            indicator: d.name || '-',
+            target: typeof d.target === 'number' ? d.target.toFixed(2) : (parseFloat(d.target) || 0).toFixed(2),
+            weight: d.is_weighted ? (Number(d.weight || 0) + '%') : 'N/A',
+            achievement: achievementVal.toFixed(2) + '%',
+            score: typeof d.score === 'number' ? d.score.toFixed(2) : (parseFloat(d.score) || 0).toFixed(2),
+            is_activity: false,
+          }
+        })
+    }
+
+    results.push({
+      employee_id: row.employee_id,
+      employee_code: row.employee_code,
+      nik: row.nik,
+      employee_name: row.employee_name,
+      unit: row.unit || '-',
+      bank_name: row.bank_name,
+      bank_account_number: row.bank_account_number,
+      bank_account_holder: row.bank_account_holder,
+      tax_status: row.tax_status || 'Non-PKP',
+      employee_status: row.employee_status || '-',
+      pns_grade: (row.pns_grade && row.pns_grade !== '-' && row.pns_grade !== 'null') ? row.pns_grade : '-',
+      tax_type: row.tax_type || '-',
+      p1_score: row.p1_score,
+      p1_weighted: row.p1_score,
+      p1_weight: p1Weight,
+      p1_priority: row.p1_priority || 0,
+      p1_breakdown: buildBreakdown('P1'),
+      p2_score: row.p2_score,
+      p2_weighted: row.p2_score,
+      p2_weight: p2Weight,
+      p2_priority: row.p2_priority || 0,
+      p2_breakdown: buildBreakdown('P2'),
+      p3_score: row.p3_score,
+      p3_weighted: row.p3_score,
+      p3_weight: p3Weight,
+      p3_priority: row.p3_priority || 0,
+      p3_breakdown: buildBreakdown('P3'),
+      total_priority_score: row.total_priority_score || 0,
+      total_score: row.total_score,
+      pir_value: row.pir_value,
+      total_activity: row.total_activity,
+      total_activity_rupiah: row.total_activity_rupiah,
+      index_incentive: row.index_incentive,
+      guarantee_fee: row.guarantee_fee,
+      total_skor_unit: row.total_skor_unit,
+      unit_proportion: row.unit_proportion,
+      unit_allocation: row.unit_allocation,
+      unit_total_activity: row.unit_total_activity,
+      potongan: row.potongan,
+      distribusi_potongan: row.distribusi_potongan,
+      gross_incentive: row.gross_incentive,
+      tax_amount: row.tax_amount,
+      tax_detail: row.tax_detail || '-',
+      net_incentive: row.net_incentive,
+      tax_mechanism_used: row.tax_mechanism_used,
+      assessment_details: details,
+    })
+  }
+
+  return results
+}
