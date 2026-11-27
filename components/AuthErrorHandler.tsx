@@ -9,7 +9,10 @@ import { setupAuthErrorHandler } from '@/lib/utils/auth-session'
  */
 export function AuthErrorHandler() {
   useEffect(() => {
-    setupAuthErrorHandler()
+    const cleanup = setupAuthErrorHandler()
+    return () => {
+      if (typeof cleanup === 'function') cleanup()
+    }
   }, [])
 
   return null

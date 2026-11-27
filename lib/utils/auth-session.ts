@@ -109,34 +109,35 @@ export function validateSessionData(): boolean {
   }
 }
 
+let isRedirectingToLogin = false
+
 /**
  * Handle invalid refresh token error
  * Clears storage and redirects to login, UNLESS it is a 429 Rate Limit error.
  */
 export async function handleInvalidRefreshToken(error?: any) {
-  if (typeof window === 'undefined') return
+  if (typeof window === 'undefined' || isRedirectingToLogin) return
 
-  // Prevent clearing storage or logging out on 429 Rate Limit, 400 Invalid Refresh Token (race conditions), or temporary network errors
+  // Preserve session on 429 Rate Limit errors only
   if (
     error?.status === 429 ||
     error?.statusCode === 429 ||
     error?.message?.includes('429') ||
     error?.message?.includes('rate limit') ||
-    error?.message?.includes('Too Many Requests') ||
-    error?.status === 400 ||
-    error?.statusCode === 400 ||
-    error?.message?.toLowerCase().includes('invalid refresh token')
+    error?.message?.includes('Too Many Requests')
   ) {
-    console.warn('[AUTH_STORAGE] Suppressed clearing storage due to rate limit or SSR race condition (400/429)')
+    console.warn('[AUTH_STORAGE] Suppressed clearing storage due to rate limit (429)')
     return
   }
+
+  isRedirectingToLogin = true
 
   try {
     // Clear client-side storage first
     clearAuthStorage(true)
 
     const supabase = createClient()
-    // Sign out to clear server-side session (optional session clearing)
+    // Sign out locally to clear stale session cookies without extra network error
     await supabase.auth.signOut({ scope: 'local' }).catch(() => { })
 
     // Redirect to login
@@ -162,8 +163,6 @@ export function setupAuthErrorHandler() {
   // during client initialization when a stale session exists
   if (pathname === '/login') {
     validateSessionData()
-    // Clear storage on login page to ensure clean start
-    // but don't initialize Supabase client yet
     return
   }
 
@@ -173,12 +172,19 @@ export function setupAuthErrorHandler() {
   try {
     const supabase = createClient()
 
-    // Only listen for events
-    supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_OUT' && window.location.pathname === '/login') {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') {
         clearAuthStorage(true)
+        if (window.location.pathname !== '/login' && !isRedirectingToLogin) {
+          isRedirectingToLogin = true
+          window.location.href = `/login?redirectTo=${encodeURIComponent(window.location.pathname)}&error=session_expired`
+        }
       }
     })
+
+    return () => {
+      subscription.unsubscribe()
+    }
   } catch (err) {
     // Ignore initialization errors
   }
