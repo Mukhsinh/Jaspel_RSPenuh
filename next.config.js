@@ -1,6 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
 
+  // Standalone output for lightweight aaPanel/PM2 hosting (runs server.js without npm install on VPS)
+  output: 'standalone',
+
   // External packages for server
   serverExternalPackages: ['xlsx'],
 
