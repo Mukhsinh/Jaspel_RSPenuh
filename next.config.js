@@ -4,6 +4,9 @@ const nextConfig = {
   // External packages for server
   serverExternalPackages: ['xlsx'],
 
+  // Hide X-Powered-By header in production
+  poweredByHeader: false,
+
   // Enable compression
   compress: true,
 
